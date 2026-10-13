@@ -76,6 +76,9 @@ data class TrainerState(
     val twinStatusKnown: Boolean = false,
     val error: String? = null,
     val isSimulated: Boolean = false,
+    /** Optional bridge capabilities narrow the normal device-state gates. */
+    val editableParameters: Set<Parameter>? = null,
+    val modeChangeAllowed: Boolean = true,
 ) {
     val connected
         get() = status == ConnectionStatus.READY
@@ -100,12 +103,14 @@ data class TrainerState(
             twinStatusKnown &&
             !twinReported &&
             parameter in parameters &&
+            (editableParameters == null || parameter in editableParameters) &&
             parameter in Parameter.forMode(mode) &&
             (unloaded || (parameter == Parameter.WEIGHT && fitnessMode in listOf(5, 21)))
 
     val canChangeMode
         get() =
             mode != null &&
+                modeChangeAllowed &&
                 connected &&
                 fresh &&
                 unloaded &&
@@ -123,4 +128,13 @@ data class VoltraState(
     val twinPending: Boolean = false,
     val twinSupported: Boolean = false,
     val isSimulated: Boolean = false,
+    val knob: KnobState? = null,
+    val viaKnob: Boolean = false,
+)
+
+data class KnobState(
+    val device: VoltraDevice,
+    val status: ConnectionStatus,
+    val batteryPercent: Int? = null,
+    val error: String? = null,
 )

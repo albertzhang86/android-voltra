@@ -24,9 +24,21 @@ internal object VoltraGatt {
     val cccd: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 }
 
+internal data class GattProfile(
+    val service: UUID = VoltraGatt.service,
+    val write: UUID = VoltraGatt.write,
+    val notify: UUID = VoltraGatt.notify,
+    val namePrefix: String? = "VTR-",
+    val minimumMtu: Int = 64,
+    val connectTimeoutMs: Long = 15_000,
+)
+
 /** One native GATT instance per trainer; the controller enforces the two-device limit. */
 @SuppressLint("MissingPermission")
-class AndroidVoltraTransport(context: Context) : VoltraTransport {
+class AndroidVoltraTransport
+internal constructor(context: Context, private val profile: GattProfile) : VoltraTransport {
+    constructor(context: Context) : this(context, GattProfile())
+
     private val context = context.applicationContext
     private val adapter
         get() = context.getSystemService(BluetoothManager::class.java)?.adapter
@@ -45,9 +57,10 @@ class AndroidVoltraTransport(context: Context) : VoltraTransport {
                                 val name = record?.deviceName ?: result.device.name.orEmpty()
                                 if (
                                     !result.isConnectable ||
-                                        (record?.serviceUuids?.any {
-                                            it.uuid == VoltraGatt.service
-                                        } != true && !name.startsWith("VTR-"))
+                                        (record?.serviceUuids?.any { it.uuid == profile.service } !=
+                                            true &&
+                                            (profile.namePrefix == null ||
+                                                !name.startsWith(profile.namePrefix)))
                                 )
                                     return
                                 val device =
@@ -100,9 +113,13 @@ class AndroidVoltraTransport(context: Context) : VoltraTransport {
                 "Select a discovered VOLTRA."
             }
             val link =
-                AndroidVoltraLink(context, requireNotNull(adapter).getRemoteDevice(device.id))
+                AndroidVoltraLink(
+                    context,
+                    requireNotNull(adapter).getRemoteDevice(device.id),
+                    profile,
+                )
             try {
-                withTimeout(15_000) { link.ready.await() }
+                withTimeout(profile.connectTimeoutMs) { link.ready.await() }
                 link
             } catch (failure: Exception) {
                 link.close()
@@ -112,8 +129,11 @@ class AndroidVoltraTransport(context: Context) : VoltraTransport {
 }
 
 @SuppressLint("MissingPermission")
-private class AndroidVoltraLink(private val context: Context, device: BluetoothDevice) :
-    VoltraLink {
+private class AndroidVoltraLink(
+    private val context: Context,
+    device: BluetoothDevice,
+    private val profile: GattProfile,
+) : VoltraLink {
     val ready = CompletableDeferred<Unit>()
     private val incoming = Channel<ByteArray>(256)
     override val packets = incoming.receiveAsFlow()
@@ -142,7 +162,7 @@ private class AndroidVoltraLink(private val context: Context, device: BluetoothD
             override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
                 if (closed.get()) return
                 operation {
-                    check(status == BluetoothGatt.GATT_SUCCESS && mtu >= 64) {
+                    check(status == BluetoothGatt.GATT_SUCCESS && mtu >= profile.minimumMtu) {
                         "VOLTRA requires a larger Bluetooth packet size."
                     }
                     check(gatt.discoverServices()) { "Unable to discover VOLTRA services." }
@@ -156,13 +176,12 @@ private class AndroidVoltraLink(private val context: Context, device: BluetoothD
                         "VOLTRA service discovery failed."
                     }
                     val service =
-                        gatt.getService(VoltraGatt.service)
-                            ?: error("VOLTRA service is unavailable.")
+                        gatt.getService(profile.service) ?: error("VOLTRA service is unavailable.")
                     writer =
-                        service.getCharacteristic(VoltraGatt.write)
+                        service.getCharacteristic(profile.write)
                             ?: error("VOLTRA controls are unavailable.")
                     val updates =
-                        service.getCharacteristic(VoltraGatt.notify)
+                        service.getCharacteristic(profile.notify)
                             ?: error("VOLTRA notifications are unavailable.")
                     check(updates.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0)
                     check(gatt.setCharacteristicNotification(updates, true))
@@ -188,7 +207,7 @@ private class AndroidVoltraLink(private val context: Context, device: BluetoothD
                 characteristic: BluetoothGattCharacteristic,
                 status: Int,
             ) {
-                if (closed.get() || characteristic.uuid != VoltraGatt.write) return
+                if (closed.get() || characteristic.uuid != profile.write) return
                 if (status == BluetoothGatt.GATT_SUCCESS) writeResult?.complete(Unit)
                 else fail("VOLTRA Bluetooth write failed ($status).")
             }
@@ -211,8 +230,8 @@ private class AndroidVoltraLink(private val context: Context, device: BluetoothD
             private fun receive(characteristic: BluetoothGattCharacteristic, value: ByteArray) {
                 if (
                     !closed.get() &&
-                        characteristic.uuid == VoltraGatt.notify &&
-                        characteristic.service?.uuid == VoltraGatt.service
+                        characteristic.uuid == profile.notify &&
+                        characteristic.service?.uuid == profile.service
                 ) {
                     if (!incoming.trySend(value.copyOf()).isSuccess)
                         fail("VOLTRA data buffer overflow. Reconnect to continue.")

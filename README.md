@@ -14,6 +14,14 @@ UI-free Kotlin/JVM protocol and Android BLE connector for Beyond Power VOLTRA tr
 
 The direct connector supports up to two independent connections, battery, live cable force, per-device reps, and four modes: Weight Training, Resistance Band, Damper and Isokinetic. Settings remain device-confirmed: a successful Bluetooth write alone does not update the displayed value. Connecting, starting an app set and reconnecting never change resistance or load the motor.
 
+### Bluetooth knob bridge
+
+`KnobVoltraController` and `AndroidKnobTransport` connect through the matching
+Guition VOLTRA Remote firmware. The knob owns one selected trainer; the TV receives
+readings and sends validated, expiring setting commands. Native Twin and motor
+load/unload are not exposed through this bridge. See [protocol and pairing](docs/knob-bridge.md).
+The JVM/demo checks and firmware build do not replace physical pairing/coexistence tests.
+
 ### Twin status
 
 **Native Twin creation/exit and Twin telemetry are not implemented.** The verified public protocol sources used here do not provide the native pair/unpair exchange or validated role/peer verification. The direct connector reports `twinSupported = false`; its Twin methods fail without sending control commands. A trainer already reporting Twin mode is read-only, and independent force/rep decoding is withheld for that device. Two connections alone never imply a Twin pair.
