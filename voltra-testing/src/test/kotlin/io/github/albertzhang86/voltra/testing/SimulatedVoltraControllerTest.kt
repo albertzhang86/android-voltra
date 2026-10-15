@@ -9,6 +9,61 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class SimulatedVoltraControllerTest {
     @Test
+    fun `finished demo sets become unloaded so the next exercise can enter and exit Twin`() =
+        runTest {
+            for (viaKnob in listOf(false, true)) {
+                val controller: VoltraController =
+                    if (viaKnob) SimulatedKnobController(backgroundScope)
+                    else SimulatedVoltraController(backgroundScope)
+                if (viaKnob) controller.connect(SimulatedKnobController.DEVICE)
+                else SimulatedVoltraController.devices.forEach { controller.connect(it) }
+                runCurrent()
+                controller.setParameter("demo-left", Parameter.WEIGHT, 45)
+                controller.beginSet()
+                advanceTimeBy(5_100)
+                runCurrent()
+                assertTrue(controller.state.value.trainers.all { it.loaded && it.reps == 1 })
+                assertFalse(controller.state.value.canCreateTwin)
+                controller.endSet()
+                runCurrent()
+                val finished = controller.state.value.trainers
+                assertTrue(finished.all { it.unloaded && it.activeWeightLb == 0.0 })
+                assertTrue(finished.all { it.measuredForceLb == null && it.cableMoving == null })
+                assertEquals(45, finished.first().setWeightLb)
+                advanceTimeBy(5_000)
+                runCurrent()
+                assertEquals(
+                    finished.map { it.reps },
+                    controller.state.value.trainers.map { it.reps },
+                )
+                assertEquals(
+                    finished.map { it.deviceReps },
+                    controller.state.value.trainers.map { it.deviceReps },
+                )
+                assertTrue(controller.state.value.canCreateTwin)
+                controller.createTwin("demo-left", "demo-right")
+                controller.beginSet()
+                runCurrent()
+                assertFalse(controller.state.value.canExitTwin)
+                advanceTimeBy(5_100)
+                runCurrent()
+                assertEquals(1, controller.state.value.twin?.reps)
+                controller.endSet()
+                runCurrent()
+                assertTrue(controller.state.value.canExitTwin)
+                controller.exitTwin()
+                runCurrent()
+                assertNull(controller.state.value.twin)
+                assertTrue(controller.state.value.trainers.all { it.unloaded })
+                controller.beginSet()
+                advanceTimeBy(5_100)
+                runCurrent()
+                assertTrue(controller.state.value.trainers.all { it.loaded && it.reps == 1 })
+                controller.close()
+            }
+        }
+
+    @Test
     fun `Twin telemetry has one rep count and both batteries`() = runTest {
         val controller = SimulatedVoltraController(backgroundScope)
         SimulatedVoltraController.devices.forEach { controller.connect(it) }
@@ -19,6 +74,7 @@ class SimulatedVoltraControllerTest {
         assertEquals("demo-right", pair.controllerId)
         assertEquals(TwinHealth.READY, pair.health)
         assertEquals(1, pair.reps)
+        assertTrue(controller.state.value.trainers.all { it.deviceReps == null })
         assertEquals(60, pair.setWeightLb)
         assertNotNull(pair.activeWeightLb)
         assertEquals(listOf(86, 72), controller.state.value.trainers.map { it.batteryPercent })
@@ -40,6 +96,7 @@ class SimulatedVoltraControllerTest {
         assertEquals(TwinHealth.DEGRADED, state.twin?.health)
         assertNull(state.twin?.activeWeightLb)
         assertNull(state.twin?.reps)
+        assertTrue(state.trainers.all { it.deviceReps == null })
         assertFalse(state.canCreateTwin)
         assertFalse(state.canExitTwin)
         assertFalse(state.trainers.first().canEdit(Parameter.WEIGHT))
@@ -123,22 +180,116 @@ class SimulatedVoltraControllerTest {
             assertEquals(mode, controller.state.value.trainers.first().mode)
             assertEquals(TrainingMode.WEIGHT, controller.state.value.trainers.last().mode)
         }
-        assertTrue(controller.state.value.trainers.all {
-            it.activeWeightLb == 0.0 && it.activeWeightSource == ActiveWeightSource.UNLOADED
-        })
+        assertTrue(
+            controller.state.value.trainers.all {
+                it.activeWeightLb == 0.0 && it.activeWeightSource == ActiveWeightSource.UNLOADED
+            }
+        )
         controller.beginSet()
         advanceTimeBy(5_100)
         runCurrent()
         assertEquals(listOf(86, 72), controller.state.value.trainers.map { it.batteryPercent })
         assertTrue(
             controller.state.value.trainers.all {
-                it.reps == 1 && it.activeWeightLb != null && it.isSimulated &&
-                    it.activeWeightSource == ActiveWeightSource.TARGET_FORCE && it.loaded
+                it.reps == 1 &&
+                    it.activeWeightLb != null &&
+                    it.isSimulated &&
+                    it.activeWeightSource == ActiveWeightSource.TARGET_FORCE &&
+                    it.loaded
             }
         )
         controller.beginSet()
         assertTrue(controller.state.value.trainers.all { it.reps == 0 })
         controller.close()
+    }
+
+    @Test
+    fun `starting an app set preserves the independent demo device counter`() = runTest {
+        val controller = SimulatedVoltraController(backgroundScope)
+        controller.connect(SimulatedVoltraController.devices.first())
+        assertEquals(0, controller.state.value.trainers.single().deviceReps)
+        controller.beginSet()
+        advanceTimeBy(5_100)
+        runCurrent()
+        assertEquals(1, controller.state.value.trainers.single().deviceReps)
+        assertEquals(1, controller.state.value.trainers.single().reps)
+
+        controller.beginSet()
+        assertEquals(1, controller.state.value.trainers.single().deviceReps)
+        assertEquals(0, controller.state.value.trainers.single().reps)
+        advanceTimeBy(250)
+        runCurrent()
+        assertEquals(1, controller.state.value.trainers.single().deviceReps)
+        assertEquals(0, controller.state.value.trainers.single().reps)
+        advanceTimeBy(4_900)
+        runCurrent()
+        assertEquals(2, controller.state.value.trainers.single().deviceReps)
+        assertEquals(1, controller.state.value.trainers.single().reps)
+        controller.disconnect(SimulatedVoltraController.devices.first().id)
+        assertTrue(controller.state.value.trainers.isEmpty())
+        controller.close()
+    }
+
+    @Test
+    fun `starting a set just before a device rep keeps the full planned cadence`() = runTest {
+        val controller = SimulatedVoltraController(backgroundScope)
+        controller.connect(SimulatedVoltraController.devices.first())
+        advanceTimeBy(4_750)
+        runCurrent()
+        controller.beginSet()
+        advanceTimeBy(250)
+        runCurrent()
+        assertEquals(1, controller.state.value.trainers.single().deviceReps)
+        assertEquals(0, controller.state.value.trainers.single().reps)
+        advanceTimeBy(4_749)
+        runCurrent()
+        assertEquals(0, controller.state.value.trainers.single().reps)
+        advanceTimeBy(1)
+        runCurrent()
+        assertEquals(1, controller.state.value.trainers.single().reps)
+        assertEquals(1, controller.state.value.trainers.single().deviceReps)
+        controller.close()
+    }
+
+    @Test
+    fun `all modes publish motion only during loaded independent demo pulls`() = runTest {
+        for (mode in TrainingMode.entries) {
+            val controller = SimulatedVoltraController(backgroundScope)
+            val device = SimulatedVoltraController.devices.first()
+            controller.connect(device)
+            controller.setMode(device.id, mode)
+            assertNull(controller.state.value.trainers.single().measuredForceLb)
+            assertNull(controller.state.value.trainers.single().cableMoving)
+
+            controller.beginSet()
+            assertNull(controller.state.value.trainers.single().measuredForceLb)
+            advanceTimeBy(251)
+            runCurrent()
+            val moving = controller.state.value.trainers.single()
+            assertTrue(moving.isSimulated && moving.loaded && moving.cableMoving == true)
+            assertNotNull(moving.measuredForceLb)
+            assertEquals(mode, moving.mode)
+
+            advanceTimeBy(4_000)
+            runCurrent()
+            val resting = controller.state.value.trainers.single()
+            assertTrue(resting.loaded)
+            assertNull(resting.measuredForceLb)
+            assertNull(resting.cableMoving)
+
+            controller.beginSet()
+            advanceTimeBy(251)
+            runCurrent()
+            assertNotNull(controller.state.value.trainers.single().measuredForceLb)
+            controller.disconnect(device.id)
+            assertTrue(controller.state.value.trainers.isEmpty())
+            controller.connect(device)
+            advanceTimeBy(251)
+            runCurrent()
+            assertNull(controller.state.value.trainers.single().measuredForceLb)
+            assertNull(controller.state.value.trainers.single().cableMoving)
+            controller.close()
+        }
     }
 
     @Test

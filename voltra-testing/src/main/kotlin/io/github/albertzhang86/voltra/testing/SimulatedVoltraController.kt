@@ -15,6 +15,8 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
         MutableStateFlow(VoltraState(twinSupported = true, isSimulated = true))
     override val state = mutableState.asStateFlow()
     private var tick = 0
+    private var motionTick = 0
+    private var betweenSets = false
     private val commands = Mutex()
     private var generation = 0
 
@@ -22,26 +24,45 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
         scope.launch {
             while (isActive) {
                 delay(250)
-                tick++
+                if (!betweenSets) {
+                    tick++
+                    motionTick++
+                }
                 mutableState.update { old ->
                     val trainers =
                         old.trainers.mapIndexed { index, trainer ->
                             val base = trainer.setWeightLb ?: 30
-                            val ready = trainer.connected && trainer.fresh && old.twin?.health != TwinHealth.DEGRADED
-                            val target = (base * (0.75 + 0.25 * sin(tick / 3.0 + index))).takeIf { ready && trainer.loaded }
+                            val ready =
+                                trainer.connected &&
+                                    trainer.fresh &&
+                                    old.twin?.health != TwinHealth.DEGRADED
+                            val target =
+                                (base * (0.75 + 0.25 * sin(tick / 3.0 + index))).takeIf {
+                                    ready && trainer.loaded
+                                }
+                            // Four seconds of movement followed by one second of rest per rep.
+                            val moving =
+                                target != null &&
+                                    old.twin == null &&
+                                    !trainer.twinReported &&
+                                    motionTick % 20 in 1..16
                             trainer.copy(
-                                activeWeightLb = if (ready && trainer.fitnessMode == 4) 0.0 else target,
-                                activeWeightSource = when {
-                                    ready && trainer.fitnessMode == 4 -> ActiveWeightSource.UNLOADED
-                                    target != null -> ActiveWeightSource.TARGET_FORCE
-                                    else -> null
-                                },
+                                activeWeightLb =
+                                    if (ready && trainer.fitnessMode == 4) 0.0 else target,
+                                activeWeightSource =
+                                    when {
+                                        ready && trainer.fitnessMode == 4 ->
+                                            ActiveWeightSource.UNLOADED
+                                        target != null -> ActiveWeightSource.TARGET_FORCE
+                                        else -> null
+                                    },
                                 resistanceTargetLb = target,
-                                reps =
+                                measuredForceLb = target.takeIf { moving },
+                                cableMoving = true.takeIf { moving },
+                                reps = (motionTick / 20).takeIf { ready },
+                                deviceReps =
                                     (tick / 20).takeIf {
-                                        trainer.connected &&
-                                            trainer.fresh &&
-                                            old.twin?.health != TwinHealth.DEGRADED
+                                        ready && old.twin == null && !trainer.twinReported
                                     },
                             )
                         }
@@ -72,6 +93,7 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
                             activeWeightLb = 0.0,
                             activeWeightSource = ActiveWeightSource.UNLOADED,
                             reps = 0,
+                            deviceReps = tick / 20,
                             fitnessMode = 4,
                             fresh = true,
                             twinStatusKnown = true,
@@ -90,6 +112,7 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
                             it.copy(
                                 twinReported = true,
                                 twinVerified = true,
+                                deviceReps = null,
                                 twinRole =
                                     if (it.device.id == pair.controllerId) TwinRole.CONTROLLER
                                     else TwinRole.PEER,
@@ -115,7 +138,10 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
                                     activeWeightLb = null,
                                     activeWeightSource = null,
                                     resistanceTargetLb = null,
+                                    measuredForceLb = null,
+                                    cableMoving = null,
                                     reps = null,
+                                    deviceReps = null,
                                 )
                             else trainer
                         },
@@ -208,7 +234,10 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
                                     activeWeightLb = s.activeWeightLb,
                                     activeWeightSource = s.activeWeightSource,
                                     resistanceTargetLb = s.resistanceTargetLb,
+                                    measuredForceLb = s.measuredForceLb,
+                                    cableMoving = s.cableMoving,
                                     reps = s.reps,
+                                    deviceReps = s.deviceReps,
                                     pending = false,
                                 ) ?: s
                             }
@@ -244,6 +273,7 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
                                 parameters = controller.parameters,
                                 twinReported = true,
                                 twinVerified = true,
+                                deviceReps = null,
                                 twinRole =
                                     if (s.device.id == controllerId) TwinRole.CONTROLLER
                                     else TwinRole.PEER,
@@ -293,18 +323,48 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
     }
 
     override fun beginSet() {
-        tick = 0
+        betweenSets = false
+        motionTick = 0
         mutableState.update {
             it.copy(
-                trainers = it.trainers.map { s ->
-                    s.copy(reps = 0, fitnessMode = 5, activeWeightLb = null,
-                        activeWeightSource = null, resistanceTargetLb = null)
-                },
+                trainers =
+                    it.trainers.map { s ->
+                        s.copy(
+                            reps = s.reps?.let { 0 },
+                            fitnessMode = 5,
+                            activeWeightLb = null,
+                            activeWeightSource = null,
+                            resistanceTargetLb = null,
+                            measuredForceLb = null,
+                            cableMoving = null,
+                        )
+                    },
                 twin =
                     it.twin?.let { pair ->
                         pair.copy(reps = if (pair.health == TwinHealth.READY) 0 else null)
                     },
             )
+        }
+    }
+
+    override fun endSet() {
+        betweenSets = true
+        mutableState.update { old ->
+            val trainers =
+                old.trainers.map { trainer ->
+                    if (!trainer.connected || !trainer.fresh) trainer
+                    else
+                        trainer.copy(
+                            fitnessMode = 4,
+                            activeWeightLb = 0.0,
+                            activeWeightSource = ActiveWeightSource.UNLOADED,
+                            resistanceTargetLb = null,
+                            measuredForceLb = null,
+                            runtimeWireWeightLb = null,
+                            cableMoving = null,
+                        )
+                }
+            old.copy(trainers = trainers, twin = telemetry(old.twin, trainers))
         }
     }
 

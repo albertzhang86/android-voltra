@@ -53,6 +53,8 @@ class SimulatedKnobController(parentScope: CoroutineScope) : VoltraController {
 
     override fun beginSet() = delegate.beginSet()
 
+    override fun endSet() = delegate.endSet()
+
     override fun close() {
         delegate.close()
         job.cancel()

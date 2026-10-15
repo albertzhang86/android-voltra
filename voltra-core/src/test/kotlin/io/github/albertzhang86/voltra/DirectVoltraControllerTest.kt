@@ -11,111 +11,213 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class DirectVoltraControllerTest {
     @Test
-    fun `explicitly unloaded resistance is zero while residual tension remains separate`() = runTest {
-        val rig = Rig(this)
-        rig.link().values[VoltraProtocol.RUNTIME_WIRE_WEIGHT] = 1
-        rig.ready()
-        rig.link().send(terseForce(11, targetTenths = 300))
-        runCurrent()
-        assertEquals(0.0, rig.trainer().activeWeightLb!!, 0.001)
-        assertEquals(ActiveWeightSource.UNLOADED, rig.trainer().activeWeightSource)
-        assertEquals(1.1, rig.trainer().measuredForceLb!!, 0.001)
-        assertEquals(1.0, rig.trainer().runtimeWireWeightLb!!, 0.001)
-        assertNull(rig.trainer().resistanceTargetLb)
-        assertEquals(30, rig.trainer().setWeightLb)
-        assertTrue(rig.link().writes.any {
-            it.command == 0x0f && it.register == VoltraProtocol.RUNTIME_WIRE_WEIGHT
-        })
-        rig.link().values.remove(VoltraProtocol.RUNTIME_WIRE_WEIGHT)
-        advanceTimeBy(1800)
-        runCurrent()
-        assertNull(rig.trainer().measuredForceLb)
-        assertNull(rig.trainer().runtimeWireWeightLb)
-        assertEquals(0.0, rig.trainer().activeWeightLb!!, 0.001)
-        rig.controller.close()
-    }
-
-    @Test
-    fun `loaded resistance uses captured target and expires despite fresh measured wire weight`() = runTest {
-        val rig = Rig(this)
-        rig.link().values[VoltraProtocol.FITNESS] = 5
-        rig.link().values[VoltraProtocol.RUNTIME_WIRE_WEIGHT] = 1
-        rig.ready()
-        assertNull(rig.trainer().activeWeightLb)
-        // Physical B4 capture: measured tension 1.1 lb; target resistance 6 lb.
-        rig.link().send(VoltraProtocol.hex("551904e410aacb6e0200b40b0003000000030000003c0045a8"))
-        runCurrent()
-        assertEquals(6.0, rig.trainer().activeWeightLb!!, 0.001)
-        assertEquals(6.0, rig.trainer().resistanceTargetLb!!, 0.001)
-        assertEquals(1.1, rig.trainer().measuredForceLb!!, 0.001)
-        assertEquals(ActiveWeightSource.TARGET_FORCE, rig.trainer().activeWeightSource)
-        advanceTimeBy(1800)
-        runCurrent()
-        assertTrue(rig.trainer().fresh)
-        assertEquals(1.0, rig.trainer().runtimeWireWeightLb!!, 0.001)
-        assertNull(rig.trainer().resistanceTargetLb)
-        assertNull(rig.trainer().activeWeightLb)
-        assertNull(rig.trainer().activeWeightSource)
-        rig.controller.close()
-    }
-
-    @Test
-    fun `missing or invalid target clears resistance and never falls back to force or base weight`() = runTest {
-        val rig = Rig(this)
-        rig.link().values[VoltraProtocol.FITNESS] = 5
-        rig.link().values[VoltraProtocol.RUNTIME_WIRE_WEIGHT] = 20
-        rig.ready()
-        for (packet in listOf(terseForce(427, payloadSize = 6), terseForce(427, targetTenths = 0xffff))) {
-            rig.link().send(terseForce(427, targetTenths = 200))
-            runCurrent()
-            assertEquals(20.0, rig.trainer().activeWeightLb!!, 0.001)
-            rig.link().send(packet)
-            runCurrent()
-            assertNull(rig.trainer().activeWeightLb)
-            assertNull(rig.trainer().resistanceTargetLb)
-            assertEquals(42.7, rig.trainer().measuredForceLb!!, 0.001)
-            assertEquals(30, rig.trainer().setWeightLb)
+    fun `live motion requires loaded same-sample force and signed velocity in all four modes`() =
+        runTest {
+            for (mode in TrainingMode.entries) {
+                val rig = Rig(this)
+                rig.link().values[VoltraProtocol.MODE] = mode.wireValue
+                rig.link().values[VoltraProtocol.FITNESS] = 5
+                rig.ready()
+                for (velocity in listOf(-250, -10, -9, 0, 9, 10, 250)) {
+                    rig.link().send(terseForce(11, velocityMmPerSecond = velocity, lengthMm = 500))
+                    runCurrent()
+                    assertEquals(kotlin.math.abs(velocity) >= 10, rig.trainer().cableMoving)
+                    assertEquals(1.1, rig.trainer().measuredForceLb!!, 0.001)
+                }
+                // Extended cable and residual tension at rest must not count as movement.
+                rig.link().send(terseForce(11, velocityMmPerSecond = 0, lengthMm = 500))
+                runCurrent()
+                assertEquals(false, rig.trainer().cableMoving)
+                rig.link().send(terseForce(0xffff, velocityMmPerSecond = 250))
+                runCurrent()
+                assertNull(rig.trainer().measuredForceLb)
+                assertNull(rig.trainer().cableMoving)
+                rig.controller.close()
+            }
         }
-        rig.link().send(terseForce(0xffff, targetTenths = 200))
+
+    @Test
+    fun `legacy force cannot borrow B4 motion and runtime polls cannot keep motion fresh`() =
+        runTest {
+            val rig = Rig(this)
+            rig.link().values[VoltraProtocol.FITNESS] = 5
+            rig.link().values[VoltraProtocol.RUNTIME_WIRE_WEIGHT] = 1
+            rig.ready()
+            rig.link().send(terseForce(285, velocityMmPerSecond = -100))
+            runCurrent()
+            assertEquals(true, rig.trainer().cableMoving)
+            rig.link().send(force(11))
+            runCurrent()
+            assertEquals(1.1, rig.trainer().measuredForceLb!!, 0.001)
+            assertNull(rig.trainer().cableMoving)
+            rig.link().send(terseForce(285, velocityMmPerSecond = 100))
+            runCurrent()
+            advanceTimeBy(750)
+            runCurrent()
+            assertTrue(rig.trainer().fresh)
+            assertEquals(1.0, rig.trainer().runtimeWireWeightLb!!, 0.001)
+            assertNull(rig.trainer().cableMoving)
+            rig.controller.close()
+        }
+
+    @Test
+    fun `load mode topology disconnect and stale status invalidate motion`() = runTest {
+        val rig = Rig(this)
+        rig.link().values[VoltraProtocol.FITNESS] = 5
+        rig.ready()
+        fun moving() {
+            rig.link().send(terseForce(285, velocityMmPerSecond = 100))
+            runCurrent()
+            assertEquals(true, rig.trainer().cableMoving)
+        }
+        moving()
+        for (fitness in listOf(4, 0, 0x26, 0x27)) {
+            rig.link().send(report(VoltraProtocol.FITNESS, fitness, 2))
+            rig.link().send(terseForce(11, velocityMmPerSecond = 100))
+            runCurrent()
+            assertNull(rig.trainer().cableMoving)
+            rig.link().send(report(VoltraProtocol.FITNESS, 5, 2))
+            runCurrent()
+            assertNull(rig.trainer().cableMoving)
+            moving()
+        }
+        rig.link().send(report(VoltraProtocol.MODE, 4, 2))
         runCurrent()
-        assertNull(rig.trainer().measuredForceLb)
-        assertEquals(20.0, rig.trainer().activeWeightLb!!, 0.001)
-        rig.link().send(report(VoltraProtocol.RUNTIME_WIRE_WEIGHT, -1, 2))
+        assertNull(rig.trainer().cableMoving)
+        moving()
+        rig.link().send(endpointReport(LEFT_ADDRESS, RIGHT_ADDRESS))
         runCurrent()
-        assertNull(rig.trainer().runtimeWireWeightLb)
+        assertTrue(rig.controller.state.value.trainers.all { it.cableMoving == null })
+        rig.link().send(endpointReport(LEFT_ADDRESS))
+        runCurrent()
+        assertNull(rig.trainer().cableMoving)
+        moving()
+        rig.link().respond = false
+        advanceTimeBy(4_000)
+        runCurrent()
+        rig.link().send(terseForce(285, velocityMmPerSecond = 100))
+        runCurrent()
+        assertFalse(rig.trainer().fresh)
+        assertNull(rig.trainer().cableMoving)
+        rig.controller.disconnect("left")
+        assertTrue(rig.controller.state.value.trainers.isEmpty())
         rig.controller.close()
     }
 
     @Test
-    fun `load transitions discard target and residual readings from the previous load state`() = runTest {
-        val rig = Rig(this)
-        rig.link().values[VoltraProtocol.FITNESS] = 5
-        rig.ready()
-        rig.link().send(terseForce(427, targetTenths = 300))
-        runCurrent()
-        rig.link().send(report(VoltraProtocol.FITNESS, 4, 2))
-        runCurrent()
-        assertEquals(0.0, rig.trainer().activeWeightLb!!, 0.001)
-        assertEquals(ActiveWeightSource.UNLOADED, rig.trainer().activeWeightSource)
-        assertNull(rig.trainer().measuredForceLb)
-        assertNull(rig.trainer().resistanceTargetLb)
-        rig.link().send(terseForce(11, targetTenths = 300))
-        rig.link().send(report(VoltraProtocol.FITNESS, 5, 2))
-        runCurrent()
-        assertNull(rig.trainer().activeWeightLb)
-        assertNull(rig.trainer().measuredForceLb)
-        rig.link().send(terseForce(200, targetTenths = 300))
-        runCurrent()
-        assertEquals(30.0, rig.trainer().activeWeightLb!!, 0.001)
-        for (unknown in listOf(0, 6, 65535)) {
-            rig.link().send(report(VoltraProtocol.FITNESS, unknown, 2))
+    fun `explicitly unloaded resistance is zero while residual tension remains separate`() =
+        runTest {
+            val rig = Rig(this)
+            rig.link().values[VoltraProtocol.RUNTIME_WIRE_WEIGHT] = 1
+            rig.ready()
             rig.link().send(terseForce(11, targetTenths = 300))
             runCurrent()
+            assertEquals(0.0, rig.trainer().activeWeightLb!!, 0.001)
+            assertEquals(ActiveWeightSource.UNLOADED, rig.trainer().activeWeightSource)
+            assertEquals(1.1, rig.trainer().measuredForceLb!!, 0.001)
+            assertEquals(1.0, rig.trainer().runtimeWireWeightLb!!, 0.001)
+            assertNull(rig.trainer().resistanceTargetLb)
+            assertEquals(30, rig.trainer().setWeightLb)
+            assertTrue(
+                rig.link().writes.any {
+                    it.command == 0x0f && it.register == VoltraProtocol.RUNTIME_WIRE_WEIGHT
+                }
+            )
+            rig.link().values.remove(VoltraProtocol.RUNTIME_WIRE_WEIGHT)
+            advanceTimeBy(1800)
+            runCurrent()
+            assertNull(rig.trainer().measuredForceLb)
+            assertNull(rig.trainer().runtimeWireWeightLb)
+            assertEquals(0.0, rig.trainer().activeWeightLb!!, 0.001)
+            rig.controller.close()
+        }
+
+    @Test
+    fun `loaded resistance uses captured target and expires despite fresh measured wire weight`() =
+        runTest {
+            val rig = Rig(this)
+            rig.link().values[VoltraProtocol.FITNESS] = 5
+            rig.link().values[VoltraProtocol.RUNTIME_WIRE_WEIGHT] = 1
+            rig.ready()
+            assertNull(rig.trainer().activeWeightLb)
+            // Physical B4 capture: measured tension 1.1 lb; target resistance 6 lb.
+            rig.link()
+                .send(VoltraProtocol.hex("551904e410aacb6e0200b40b0003000000030000003c0045a8"))
+            runCurrent()
+            assertEquals(6.0, rig.trainer().activeWeightLb!!, 0.001)
+            assertEquals(6.0, rig.trainer().resistanceTargetLb!!, 0.001)
+            assertEquals(1.1, rig.trainer().measuredForceLb!!, 0.001)
+            assertEquals(ActiveWeightSource.TARGET_FORCE, rig.trainer().activeWeightSource)
+            advanceTimeBy(1800)
+            runCurrent()
+            assertTrue(rig.trainer().fresh)
+            assertEquals(1.0, rig.trainer().runtimeWireWeightLb!!, 0.001)
+            assertNull(rig.trainer().resistanceTargetLb)
             assertNull(rig.trainer().activeWeightLb)
             assertNull(rig.trainer().activeWeightSource)
+            rig.controller.close()
         }
-        rig.controller.close()
-    }
+
+    @Test
+    fun `missing or invalid target clears resistance and never falls back to force or base weight`() =
+        runTest {
+            val rig = Rig(this)
+            rig.link().values[VoltraProtocol.FITNESS] = 5
+            rig.link().values[VoltraProtocol.RUNTIME_WIRE_WEIGHT] = 20
+            rig.ready()
+            for (packet in
+                listOf(terseForce(427, payloadSize = 6), terseForce(427, targetTenths = 0xffff))) {
+                rig.link().send(terseForce(427, targetTenths = 200))
+                runCurrent()
+                assertEquals(20.0, rig.trainer().activeWeightLb!!, 0.001)
+                rig.link().send(packet)
+                runCurrent()
+                assertNull(rig.trainer().activeWeightLb)
+                assertNull(rig.trainer().resistanceTargetLb)
+                assertEquals(42.7, rig.trainer().measuredForceLb!!, 0.001)
+                assertEquals(30, rig.trainer().setWeightLb)
+            }
+            rig.link().send(terseForce(0xffff, targetTenths = 200))
+            runCurrent()
+            assertNull(rig.trainer().measuredForceLb)
+            assertEquals(20.0, rig.trainer().activeWeightLb!!, 0.001)
+            rig.link().send(report(VoltraProtocol.RUNTIME_WIRE_WEIGHT, -1, 2))
+            runCurrent()
+            assertNull(rig.trainer().runtimeWireWeightLb)
+            rig.controller.close()
+        }
+
+    @Test
+    fun `load transitions discard target and residual readings from the previous load state`() =
+        runTest {
+            val rig = Rig(this)
+            rig.link().values[VoltraProtocol.FITNESS] = 5
+            rig.ready()
+            rig.link().send(terseForce(427, targetTenths = 300))
+            runCurrent()
+            rig.link().send(report(VoltraProtocol.FITNESS, 4, 2))
+            runCurrent()
+            assertEquals(0.0, rig.trainer().activeWeightLb!!, 0.001)
+            assertEquals(ActiveWeightSource.UNLOADED, rig.trainer().activeWeightSource)
+            assertNull(rig.trainer().measuredForceLb)
+            assertNull(rig.trainer().resistanceTargetLb)
+            rig.link().send(terseForce(11, targetTenths = 300))
+            rig.link().send(report(VoltraProtocol.FITNESS, 5, 2))
+            runCurrent()
+            assertNull(rig.trainer().activeWeightLb)
+            assertNull(rig.trainer().measuredForceLb)
+            rig.link().send(terseForce(200, targetTenths = 300))
+            runCurrent()
+            assertEquals(30.0, rig.trainer().activeWeightLb!!, 0.001)
+            for (unknown in listOf(0, 6, 65535)) {
+                rig.link().send(report(VoltraProtocol.FITNESS, unknown, 2))
+                rig.link().send(terseForce(11, targetTenths = 300))
+                runCurrent()
+                assertNull(rig.trainer().activeWeightLb)
+                assertNull(rig.trainer().activeWeightSource)
+            }
+            rig.controller.close()
+        }
 
     @Test
     fun `mode and endpoint changes invalidate every live source immediately`() = runTest {
@@ -271,10 +373,14 @@ class DirectVoltraControllerTest {
     fun `stale status disables writes and timeout clears live data`() = runTest {
         val rig = Rig(this)
         rig.ready()
+        rig.link().send(rep(4, rawCounter = 7))
+        runCurrent()
+        assertEquals(8, rig.trainer().deviceReps)
         rig.link().respond = false
         advanceTimeBy(4_000)
         runCurrent()
         assertFalse(rig.trainer().fresh)
+        assertNull(rig.trainer().deviceReps)
         assertTrue(
             runCatching { rig.controller.setParameter("left", Parameter.WEIGHT, 50) }.isFailure
         )
@@ -282,8 +388,87 @@ class DirectVoltraControllerTest {
         runCurrent()
         assertEquals(ConnectionStatus.FAILED, rig.trainer().status)
         assertNull(rig.trainer().activeWeightLb)
+        assertNull(rig.trainer().deviceReps)
         rig.controller.disconnect("left")
         assertTrue(rig.controller.state.value.trainers.isEmpty())
+        rig.controller.close()
+    }
+
+    @Test
+    fun `captured eight-rep phase sequence counts each pull and return as one rep`() = runTest {
+        val rig = Rig(this)
+        rig.ready()
+        // Physical TV capture, set 9: pull 0, return 1, ... pull 7, return 8.
+        // Each notification repeats safely; delayed pulls cannot decrease the count.
+        for (index in 0..7) {
+            rig.link().send(rep(9, rawCounter = index, phase = 1))
+            runCurrent()
+            assertEquals(index + 1, rig.trainer().reps)
+            rig.link().send(rep(9, rawCounter = index + 1, phase = 2))
+            runCurrent()
+            assertEquals(index + 1, rig.trainer().reps)
+            rig.link().send(rep(9, rawCounter = index + 1, phase = 2))
+            rig.link().send(rep(9, rawCounter = index, phase = 1))
+            if (index > 0) rig.link().send(rep(9, rawCounter = index - 1, phase = 1))
+            runCurrent()
+            assertEquals(index + 1, rig.trainer().reps)
+        }
+        rig.link().send(rep(9, rawCounter = 99, phase = 3))
+        runCurrent()
+        assertEquals(8, rig.trainer().reps)
+        assertEquals(8, rig.trainer().deviceReps)
+        rig.controller.close()
+    }
+
+    @Test
+    fun `return counts preserve explicit set baselines and device set counter wrap`() = runTest {
+        val rig = Rig(this)
+        rig.ready()
+        rig.link().send(rep(65535, rawCounter = 7, phase = 2))
+        runCurrent()
+        assertEquals(7, rig.trainer().reps)
+        assertEquals(7, rig.trainer().deviceReps)
+        rig.controller.beginSet()
+        assertEquals(0, rig.trainer().reps)
+        assertEquals(7, rig.trainer().deviceReps)
+        rig.link().send(rep(65535, rawCounter = 6, phase = 1))
+        rig.link().send(rep(65535, rawCounter = 8, phase = 2))
+        runCurrent()
+        assertEquals(1, rig.trainer().reps)
+        assertEquals(8, rig.trainer().deviceReps)
+        rig.link().send(rep(0, rawCounter = 0, phase = 1))
+        rig.link().send(rep(0, rawCounter = 1, phase = 2))
+        runCurrent()
+        assertEquals(1, rig.trainer().reps)
+        assertEquals(1, rig.trainer().deviceReps)
+        rig.link().send(rep(65535, rawCounter = 99, phase = 2))
+        rig.link().send(rep(0, rawCounter = 0, phase = 1))
+        runCurrent()
+        assertEquals(1, rig.trainer().reps)
+        assertEquals(1, rig.trainer().deviceReps)
+        rig.controller.close()
+    }
+
+    @Test
+    fun `native Twin never inherits the independent device rep count`() = runTest {
+        val rig = Rig(this)
+        rig.ready()
+        rig.link().send(rep(4, rawCounter = 7))
+        runCurrent()
+        assertEquals(8, rig.trainer().deviceReps)
+        rig.link().send(endpointReport(LEFT_ADDRESS, RIGHT_ADDRESS))
+        runCurrent()
+        assertNotNull(rig.controller.state.value.twin)
+        assertTrue(rig.controller.state.value.trainers.all { it.deviceReps == null })
+        rig.link().send(rep(4, rawCounter = 8))
+        runCurrent()
+        assertTrue(rig.controller.state.value.trainers.all { it.deviceReps == null })
+        rig.link().send(endpointReport(LEFT_ADDRESS))
+        runCurrent()
+        assertNull(rig.trainer().deviceReps)
+        rig.link().send(rep(5, rawCounter = 0))
+        runCurrent()
+        assertEquals(1, rig.trainer().deviceReps)
         rig.controller.close()
     }
 
@@ -307,7 +492,7 @@ class DirectVoltraControllerTest {
         rig.link().send(rep(4, 10))
         runCurrent()
         assertEquals(1, rig.trainer().reps)
-        rig.link().send(rep(5, 1))
+        rig.link().send(rep(5, rawCounter = 0))
         runCurrent()
         assertEquals(1, rig.trainer().reps)
         rig.controller.close()

@@ -15,13 +15,115 @@ class KnobControllerTest {
     private val knob = VoltraDevice("knob", "Test knob")
     private val trainer = "01:02:03:04:05:06"
 
+    private fun movingSnapshot(): ByteArray =
+        twinSnapshot().also {
+            it[19] = 1
+            it[133] = (1 or 8 or 0x20 or 0x80).toByte()
+            ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putShort(20, 5)
+        }
+
+    @Test
+    fun `device rep count requires a ready fresh independent trainer`() {
+        val packet = snapshot(reps = 8)
+        assertEquals(8, KnobProtocol.snapshot(packet).trainer!!.deviceReps)
+        for (flags in listOf(9, 10, 3, 27)) {
+            packet[3] = flags.toByte() // Stale, not ready, unknown topology, or Twin.
+            assertNull(KnobProtocol.snapshot(packet).trainer!!.deviceReps)
+        }
+        assertNull(KnobProtocol.snapshot(snapshot(reps = 65535)).trainer!!.deviceReps)
+        assertEquals(0, KnobProtocol.snapshot(snapshot(reps = 0)).trainer!!.deviceReps)
+    }
+
+    @Test
+    fun `motion flag exposes measured force only in confirmed independent loaded states`() {
+        val packet = movingSnapshot()
+        for (mode in TrainingMode.entries) {
+            packet[19] = mode.wireValue.toByte()
+            for (fitness in listOf(5, 21)) {
+                ByteBuffer.wrap(packet)
+                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .putShort(20, fitness.toShort())
+                val decoded = KnobProtocol.snapshot(packet)
+                val trainer = decoded.trainer!!
+                assertEquals(true, trainer.cableMoving)
+                assertEquals(12.3, trainer.measuredForceLb!!, 0.001)
+                assertNull(trainer.activeWeightLb)
+                assertNull(trainer.activeWeightSource)
+                assertNull(trainer.resistanceTargetLb)
+                assertNull(trainer.runtimeWireWeightLb)
+                assertEquals(WeightUnit.KILOGRAMS, trainer.weightUnit)
+                assertTrue(decoded.knobUsbPowerConnected)
+                assertTrue(decoded.canCreateTwin)
+            }
+        }
+        for (fitness in listOf(4, 0, 0x26, 0x27, 65535)) {
+            ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN).putShort(20, fitness.toShort())
+            assertNull(KnobProtocol.snapshot(packet).trainer!!.cableMoving)
+            assertNull(KnobProtocol.snapshot(packet).trainer!!.measuredForceLb)
+        }
+        ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN).putShort(20, 5)
+        packet[19] = 0
+        assertNull(KnobProtocol.snapshot(packet).trainer!!.cableMoving)
+        packet[19] = 1
+        for (flags in listOf(9, 10, 3, 27)) {
+            packet[3] = flags.toByte() // stale, not ready, unknown topology, or Twin
+            assertNull(KnobProtocol.snapshot(packet).trainer!!.cableMoving)
+            assertNull(KnobProtocol.snapshot(packet).trainer!!.measuredForceLb)
+        }
+        packet[3] = 11
+        ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN).putInt(22, -1)
+        assertNull(KnobProtocol.snapshot(packet).trainer!!.cableMoving)
+    }
+
+    @Test
+    fun `motion source flags reject ambiguity and old bridge readings never imply motion`() {
+        for (flags in listOf(0x80 or 0x40, 0x80 or 0x10, 0x80 or 0x40 or 0x10)) {
+            val packet = movingSnapshot().also { it[133] = flags.toByte() }
+            assertTrue(runCatching { KnobProtocol.snapshot(packet) }.isFailure)
+        }
+        for (flags in listOf(0, 0x10, 0x40)) {
+            val packet = movingSnapshot().also { it[133] = flags.toByte() }
+            assertNull(KnobProtocol.snapshot(packet).trainer!!.cableMoving)
+        }
+        assertNull(KnobProtocol.snapshot(snapshot()).trainer!!.cableMoving)
+    }
+
+    @Test
+    fun `bridge movement expires before connection status and clears on legacy updates or failure`() =
+        runTest {
+            val link = Link()
+            val controller = controller(link)
+            controller.connect(knob)
+            runCurrent()
+            link.incoming.send(movingSnapshot())
+            runCurrent()
+            assertEquals(true, controller.state.value.trainers.single().cableMoving)
+            advanceTimeBy(751)
+            runCurrent()
+            assertTrue(controller.state.value.trainers.single().fresh)
+            assertNull(controller.state.value.trainers.single().cableMoving)
+            link.incoming.send(movingSnapshot())
+            runCurrent()
+            assertEquals(true, controller.state.value.trainers.single().cableMoving)
+            link.incoming.send(snapshot())
+            runCurrent()
+            assertNull(controller.state.value.trainers.single().cableMoving)
+            link.incoming.send(movingSnapshot())
+            runCurrent()
+            link.incoming.close(IllegalStateException("Disconnected"))
+            runCurrent()
+            assertTrue(controller.state.value.trainers.all { it.cableMoving == null })
+            controller.close()
+        }
+
     @Test
     fun `USB power is explicit and independent of battery percentage and trainer selection`() {
         assertFalse(KnobProtocol.snapshot(snapshot()).knobUsbPowerConnected)
-        val packet = twinSnapshot().also {
-            it[17] = 255.toByte()
-            it[133] = (1 or 8 or 16).toByte()
-        }
+        val packet =
+            twinSnapshot().also {
+                it[17] = 255.toByte()
+                it[133] = (1 or 8 or 16).toByte()
+            }
         assertFalse(KnobProtocol.snapshot(packet).knobUsbPowerConnected)
         packet[133] = (packet[133].toInt() or 0x20).toByte()
         val powered = KnobProtocol.snapshot(packet)
@@ -61,28 +163,35 @@ class KnobControllerTest {
     @Test
     fun `legacy bridge force and runtime readings never become loaded resistance`() {
         for (runtime in listOf(false, true)) {
-            val packet = twinSnapshot().also {
-                ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putShort(20, 5)
-                it[133] = (1 or 8 or if (runtime) 16 else 0).toByte()
-            }
+            val packet =
+                twinSnapshot().also {
+                    ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putShort(20, 5)
+                    it[133] = (1 or 8 or if (runtime) 16 else 0).toByte()
+                }
             val trainer = KnobProtocol.snapshot(packet).trainer!!
             assertNull(trainer.activeWeightLb)
             assertNull(trainer.activeWeightSource)
             assertNull(trainer.resistanceTargetLb)
-            assertEquals(12.3, (if (runtime) trainer.runtimeWireWeightLb else trainer.measuredForceLb)!!, 0.001)
+            assertEquals(
+                12.3,
+                (if (runtime) trainer.runtimeWireWeightLb else trainer.measuredForceLb)!!,
+                0.001,
+            )
             assertEquals(WeightUnit.KILOGRAMS, trainer.weightUnit)
         }
-        val old = snapshot().also { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putShort(20, 5) }
+        val old =
+            snapshot().also { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putShort(20, 5) }
         assertNull(KnobProtocol.snapshot(old).trainer!!.activeWeightLb)
         assertEquals(12.3, KnobProtocol.snapshot(old).trainer!!.measuredForceLb!!, 0.001)
     }
 
     @Test
     fun `target extension preserves flags and active resistance only in confirmed load states`() {
-        val packet = twinSnapshot().also {
-            it[19] = 1
-            it[133] = (1 or 8 or 0x20 or 0x40).toByte()
-        }
+        val packet =
+            twinSnapshot().also {
+                it[19] = 1
+                it[133] = (1 or 8 or 0x20 or 0x40).toByte()
+            }
         for (fitness in listOf(5, 21)) {
             ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN).putShort(20, fitness.toShort())
             val decoded = KnobProtocol.snapshot(packet)
@@ -109,7 +218,10 @@ class KnobControllerTest {
         packet[3] = 11
         ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN).putShort(20, 4)
         assertEquals(0.0, KnobProtocol.snapshot(packet).trainer!!.activeWeightLb!!, 0.001)
-        assertEquals(ActiveWeightSource.UNLOADED, KnobProtocol.snapshot(packet).trainer!!.activeWeightSource)
+        assertEquals(
+            ActiveWeightSource.UNLOADED,
+            KnobProtocol.snapshot(packet).trainer!!.activeWeightSource,
+        )
         assertNull(KnobProtocol.snapshot(packet).trainer!!.resistanceTargetLb)
         packet[3] = (packet[3].toInt() and 2.inv()).toByte()
         assertNull(KnobProtocol.snapshot(packet).trainer!!.activeWeightLb)
@@ -358,6 +470,7 @@ class KnobControllerTest {
             runCurrent()
             first.incoming.send(twinSnapshot(paired = true))
             runCurrent()
+            val beforeFailure = controller.state.value.telemetryEpoch
             first.incoming.close(
                 IllegalStateException("Knob disconnected (8). Reconnect to continue.")
             )
@@ -367,15 +480,19 @@ class KnobControllerTest {
             assertNull(controller.state.value.twin)
             assertNull(controller.state.value.knob!!.batteryPercent)
             assertFalse(controller.state.value.canExitTwin)
+            val afterFailure = controller.state.value.telemetryEpoch
+            assertTrue(afterFailure > beforeFailure)
             controller.connect(knob)
             runCurrent()
+            assertTrue(controller.state.value.telemetryEpoch >= afterFailure)
             assertEquals(ConnectionStatus.CONNECTING, controller.state.value.knob!!.status)
             assertTrue(controller.state.value.trainers.isEmpty())
             assertNull(controller.state.value.knob!!.error)
             second.incoming.send(snapshot(reps = 25))
             runCurrent()
             assertEquals(ConnectionStatus.READY, controller.state.value.knob!!.status)
-            assertEquals(0, controller.state.value.trainers.single().reps)
+            assertEquals(25, controller.state.value.trainers.single().reps)
+            assertTrue(controller.state.value.telemetryEpoch >= afterFailure)
             assertTrue(second.writes.isEmpty())
             controller.close()
         }
@@ -610,14 +727,61 @@ class KnobControllerTest {
         runCurrent()
         link.incoming.send(snapshot())
         runCurrent()
+        assertEquals(10, controller.state.value.trainers.single().deviceReps)
         advanceTimeBy(2251)
         runCurrent()
         assertFalse(controller.state.value.trainers.single().fresh)
         assertNull(controller.state.value.trainers.single().activeWeightLb)
+        assertNull(controller.state.value.trainers.single().deviceReps)
         assertTrue(runCatching { controller.setMode(trainer, TrainingMode.BAND) }.isFailure)
         assertTrue(link.writes.isEmpty())
         controller.close()
     }
+
+    @Test
+    fun `fresh same-trainer session resets advance telemetry epoch but ordinary reps do not`() =
+        runTest {
+            val link = Link()
+            val controller = controller(link)
+            controller.connect(knob)
+            runCurrent()
+            link.incoming.send(snapshot(reps = 10))
+            runCurrent()
+            val originalEpoch = controller.state.value.telemetryEpoch
+            controller.beginSet()
+            link.incoming.send(snapshot(reps = 11))
+            runCurrent()
+            assertEquals(1, controller.state.value.trainers.single().reps)
+            assertEquals(originalEpoch, controller.state.value.telemetryEpoch)
+
+            // The TV-to-knob link and trainer ID stay unchanged and every snapshot is fresh.
+            // A new bridge trainer session invalidates the app's per-set baseline nevertheless.
+            link.incoming.send(snapshot(session = 8, reps = 20))
+            runCurrent()
+            assertEquals(originalEpoch + 1, controller.state.value.telemetryEpoch)
+            assertEquals(trainer, controller.state.value.trainers.single().device.id)
+            assertTrue(controller.state.value.trainers.single().fresh)
+            assertEquals(20, controller.state.value.trainers.single().reps)
+
+            link.incoming.send(
+                snapshot(session = 8, reps = 21).also {
+                    ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putInt(4, 124)
+                }
+            )
+            runCurrent()
+            assertEquals(originalEpoch + 2, controller.state.value.telemetryEpoch)
+            link.incoming.send(
+                snapshot(session = 8, reps = 22).also {
+                    ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putInt(4, 124)
+                    "01:02:03:04:05:07".toByteArray().copyInto(it, 64)
+                }
+            )
+            runCurrent()
+            assertEquals(originalEpoch + 3, controller.state.value.telemetryEpoch)
+            controller.disconnect(knob.id)
+            assertTrue(controller.state.value.telemetryEpoch > originalEpoch + 3)
+            controller.close()
+        }
 
     @Test
     fun `trainer session change invalidates pending command and resets rep baseline`() = runTest {
@@ -632,12 +796,92 @@ class KnobControllerTest {
         link.incoming.send(snapshot(session = 8, reps = 2))
         runCurrent()
         assertTrue(edit.await().isFailure)
-        assertEquals(0, controller.state.value.trainers.single().reps)
+        assertEquals(2, controller.state.value.trainers.single().reps)
         link.incoming.send(snapshot(session = 8, reps = 4))
         runCurrent()
-        assertEquals(2, controller.state.value.trainers.single().reps)
+        assertEquals(4, controller.state.value.trainers.single().reps)
         controller.beginSet()
         assertEquals(0, controller.state.value.trainers.single().reps)
+        assertEquals(4, controller.state.value.trainers.single().deviceReps)
+        controller.close()
+    }
+
+    @Test
+    fun `unknown first count and trainer reset never consume a hardware rep`() = runTest {
+        val link = Link()
+        val controller = controller(link)
+        controller.connect(knob)
+        runCurrent()
+        link.incoming.send(snapshot(reps = 65535))
+        runCurrent()
+        assertNull(controller.state.value.trainers.single().reps)
+        link.incoming.send(snapshot(reps = 1))
+        runCurrent()
+        assertEquals(1, controller.state.value.trainers.single().reps)
+        link.incoming.send(snapshot(reps = 10))
+        runCurrent()
+        controller.beginSet()
+        assertEquals(0, controller.state.value.trainers.single().reps)
+        link.incoming.send(snapshot(reps = 1))
+        runCurrent()
+        assertEquals(1, controller.state.value.trainers.single().reps)
+        link.incoming.send(snapshot(reps = 2))
+        runCurrent()
+        assertEquals(2, controller.state.value.trainers.single().reps)
+        controller.close()
+    }
+
+    @Test
+    fun `explicit set offset survives unknown and stale readings`() = runTest {
+        val link = Link()
+        val controller = controller(link)
+        controller.connect(knob)
+        runCurrent()
+        link.incoming.send(snapshot(reps = 10))
+        runCurrent()
+        controller.beginSet()
+        link.incoming.send(snapshot(reps = 11))
+        runCurrent()
+        assertEquals(1, controller.state.value.trainers.single().reps)
+        assertEquals(11, controller.state.value.trainers.single().deviceReps)
+        link.incoming.send(snapshot(reps = 0).also { it[3] = 9 })
+        runCurrent()
+        assertNull(controller.state.value.trainers.single().reps)
+        assertNull(controller.state.value.trainers.single().deviceReps)
+        link.incoming.send(snapshot(reps = 65535))
+        runCurrent()
+        assertNull(controller.state.value.trainers.single().reps)
+        assertNull(controller.state.value.trainers.single().deviceReps)
+        link.incoming.send(snapshot().also { it[16] = 255.toByte() })
+        runCurrent()
+        assertTrue(controller.state.value.trainers.isEmpty())
+        link.incoming.send(snapshot(reps = 12))
+        runCurrent()
+        assertEquals(2, controller.state.value.trainers.single().reps)
+        assertEquals(12, controller.state.value.trainers.single().deviceReps)
+        controller.close()
+    }
+
+    @Test
+    fun `set started without a fresh count includes its first fresh rep`() = runTest {
+        val link = Link()
+        val controller = controller(link)
+        controller.connect(knob)
+        runCurrent()
+        link.incoming.send(snapshot(reps = 10))
+        runCurrent()
+        advanceTimeBy(2251)
+        runCurrent()
+        controller.beginSet()
+        assertNull(controller.state.value.trainers.single().reps)
+        link.incoming.send(snapshot(reps = 0).also { it[3] = 9 })
+        runCurrent()
+        link.incoming.send(snapshot(reps = 11))
+        runCurrent()
+        assertEquals(1, controller.state.value.trainers.single().reps)
+        link.incoming.send(snapshot(reps = 12))
+        runCurrent()
+        assertEquals(2, controller.state.value.trainers.single().reps)
         controller.close()
     }
 

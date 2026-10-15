@@ -153,17 +153,47 @@ class ProtocolTest {
             assertTrue(decoded.resistanceTargetReported)
             assertTrue(decoded.registers.isEmpty())
             assertNull(decoded.runtimeWeightLb)
+            assertEquals(3, decoded.cableLengthMm)
+            assertEquals(0, decoded.cableVelocityMmPerSecond)
         }
         for (source in 0..2) {
             val required = if (source == 0) 6 else 10
             for (size in listOf(required, required + 2)) {
-                val decoded = VoltraDecoder.decode(terseForce(427, source, size, targetTenths = 600))!!
+                val decoded =
+                    VoltraDecoder.decode(terseForce(427, source, size, targetTenths = 600))!!
                 assertEquals(42.7, decoded.cableForceLb!!, 0.001)
                 assertTrue(decoded.resistanceTargetReported)
                 if (size == required) assertNull(decoded.resistanceTargetLb)
                 else assertEquals(60.0, decoded.resistanceTargetLb!!, 0.001)
             }
         }
+    }
+
+    @Test
+    fun `terse runtime decodes signed velocity and unsigned length from the same force sample`() {
+        for (source in 0..2) {
+            val size = if (source == 0) 8 else 12
+            for (velocity in listOf(-32768, -400, 0, 400, 32767)) {
+                val decoded =
+                    VoltraDecoder.decode(
+                        terseForce(
+                            427,
+                            source,
+                            size,
+                            targetTenths = 300,
+                            velocityMmPerSecond = velocity,
+                            lengthMm = 65535,
+                        )
+                    )!!
+                assertEquals(velocity, decoded.cableVelocityMmPerSecond)
+                assertEquals(65535, decoded.cableLengthMm)
+                assertEquals(42.7, decoded.cableForceLb!!, 0.001)
+                assertEquals(30.0, decoded.resistanceTargetLb!!, 0.001)
+            }
+        }
+        val legacy = VoltraDecoder.decode(force(427))!!
+        assertNull(legacy.cableVelocityMmPerSecond)
+        assertNull(legacy.cableLengthMm)
     }
 
     @Test
@@ -174,7 +204,11 @@ class ProtocolTest {
             assertTrue(decoded.resistanceTargetReported)
             assertEquals(42.7, decoded.cableForceLb!!, 0.001)
         }
-        assertEquals(0.0, VoltraDecoder.decode(terseForce(427, targetTenths = 0))!!.resistanceTargetLb!!, 0.001)
+        assertEquals(
+            0.0,
+            VoltraDecoder.decode(terseForce(427, targetTenths = 0))!!.resistanceTargetLb!!,
+            0.001,
+        )
         assertFalse(VoltraDecoder.decode(force(427))!!.resistanceTargetReported)
         assertNull(VoltraDecoder.decode(force(427))!!.resistanceTargetLb)
     }
@@ -200,10 +234,43 @@ class ProtocolTest {
     }
 
     @Test
-    fun `pull counts are sixteen bit and return event is ignored`() {
-        assertEquals(257, VoltraDecoder.decode(rep(1025, 257))!!.rep)
-        assertEquals(1025, VoltraDecoder.decode(rep(1025, 257))!!.deviceSet)
-        assertNull(VoltraDecoder.decode(rep(1025, 257, phase = 2)))
+    fun `pull indices and return counts normalize separately without sixteen bit overflow`() {
+        for (phase in 1..2) {
+            for (raw in listOf(0, 3, 257, 65535)) {
+                val update = VoltraDecoder.decode(rep(1025, raw, phase))!!
+                assertEquals(raw + if (phase == 1) 1 else 0, update.rep)
+                assertEquals(1025, update.deviceSet)
+            }
+        }
+    }
+
+    @Test
+    fun `captured first rep is one and summary is not normalized as a per-rep index`() {
+        // SDK on-device capture: 50 lb, device set 3, followed by its one-rep summary.
+        // The pull payload's index is 0; the summary's count is already 1.
+        val perRep =
+            "554a04c610aa4a072000aa823b011a03000000f4010000000000005203810282038102cb00000075000000f40100004a060000010000520375000000bc0000004a060000000000006f1f"
+                .chunked(2)
+                .map { it.toInt(16).toByte() }
+                .toByteArray()
+        val summary =
+            "556e043c10aa8b072000aa855f010203f40100000000000003000100f9018203cb000000f501110275000000f8017b0156000000f50120013f00000052030000e8030000f40100004d170000d6ac0400bc000000b8000000bd000000b90000004a060000000000006d0b000034a5"
+                .chunked(2)
+                .map { it.toInt(16).toByte() }
+                .toByteArray()
+        assertEquals(3, VoltraDecoder.decode(perRep)!!.deviceSet)
+        assertEquals(1, VoltraDecoder.decode(perRep)!!.rep)
+        assertTrue(VoltraProtocol.valid(summary))
+        assertNull(VoltraDecoder.decode(summary))
+    }
+
+    @Test
+    fun `unrecognized rep phases and damaged rep frames are ignored`() {
+        for (phase in listOf(0, 3, 255)) {
+            assertNull(VoltraDecoder.decode(rep(1025, 257, phase)))
+        }
+        val damaged = rep(1025, 257, phase = 2).also { it[17] = 0 }
+        assertNull(VoltraDecoder.decode(damaged))
     }
 
     @Test
@@ -276,7 +343,14 @@ internal fun force(tenths: Int): ByteArray =
         }
     )
 
-internal fun terseForce(tenths: Int, source: Int = 0, payloadSize: Int = 8, targetTenths: Int = 0): ByteArray =
+internal fun terseForce(
+    tenths: Int,
+    source: Int = 0,
+    payloadSize: Int = 8,
+    targetTenths: Int = 0,
+    velocityMmPerSecond: Int = 0,
+    lengthMm: Int = 0,
+): ByteArray =
     VoltraProtocol.seal(
         ByteArray(13 + payloadSize).also {
             it[0] = 0x55
@@ -284,12 +358,16 @@ internal fun terseForce(tenths: Int, source: Int = 0, payloadSize: Int = 8, targ
             it[8] = source.toByte()
             it[10] = 0xb4.toByte()
             put(it, 11, tenths, 2)
+            if (payloadSize >= 6) {
+                put(it, 13, lengthMm, 2)
+                put(it, 15, velocityMmPerSecond, 2)
+            }
             val required = if (source == 0) 6 else 10
             if (payloadSize == required + 2) put(it, 11 + required, targetTenths, 2)
         }
     )
 
-internal fun rep(set: Int, count: Int, phase: Int = 1): ByteArray =
+internal fun rep(set: Int, rawCounter: Int, phase: Int = 1): ByteArray =
     VoltraProtocol.seal(
         ByteArray(74).also {
             it[0] = 0x55
@@ -299,7 +377,7 @@ internal fun rep(set: Int, count: Int, phase: Int = 1): ByteArray =
             it[12] = 0x3b
             it[13] = phase.toByte()
             put(it, 15, set, 2)
-            put(it, 17, count, 2)
+            put(it, 17, rawCounter, 2)
         }
     )
 

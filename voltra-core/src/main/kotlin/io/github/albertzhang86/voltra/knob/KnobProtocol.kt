@@ -102,14 +102,23 @@ object KnobProtocol {
                 val sourceFlags = if (version == 2) bytes[133].toInt() and 255 else 0
                 val isTarget = sourceFlags and 0x40 != 0
                 val isRuntime = sourceFlags and 0x10 != 0
-                require(!isTarget || !isRuntime) // These mutually exclusive flags classify offset 22.
-                val independentFresh = fresh && flags and 1 != 0 && flags and 8 != 0 && flags and 16 == 0
+                val isMovingForce = sourceFlags and 0x80 != 0
+                // Each source flag gives offset 22 a distinct meaning.
+                require(listOf(isTarget, isRuntime, isMovingForce).count { it } <= 1)
+                val independentFresh =
+                    fresh && flags and 1 != 0 && flags and 8 != 0 && flags and 16 == 0
                 val reading = force.takeIf { it >= 0 && independentFresh }?.div(10.0)
-                val target = reading.takeIf { isTarget && mode != null && fitnessMode in listOf(5, 21) }
-                val activeWeight = when {
-                    independentFresh && fitnessMode == 4 -> 0.0
-                    else -> target
-                }
+                val target =
+                    reading.takeIf { isTarget && mode != null && fitnessMode in listOf(5, 21) }
+                val movingForce =
+                    reading.takeIf { isMovingForce && mode != null && fitnessMode in listOf(5, 21) }
+                val activeWeight =
+                    when {
+                        independentFresh && fitnessMode == 4 -> 0.0
+                        else -> target
+                    }
+                val deviceReps =
+                    (b.getShort(26).toInt() and 65535).takeIf { it != 65535 && independentFresh }
                 TrainerState(
                     device = VoltraDevice(address, text(32, 32).ifBlank { "VOLTRA ${slot + 1}" }),
                     status =
@@ -124,13 +133,14 @@ object KnobProtocol {
                             if (fitnessMode == 4) ActiveWeightSource.UNLOADED
                             else ActiveWeightSource.TARGET_FORCE
                         },
-                    measuredForceLb = reading.takeIf { !isTarget && !isRuntime },
+                    measuredForceLb =
+                        if (isMovingForce) movingForce
+                        else reading.takeIf { !isTarget && !isRuntime },
+                    cableMoving = true.takeIf { movingForce != null },
                     runtimeWireWeightLb = reading.takeIf { isRuntime },
                     resistanceTargetLb = target,
-                    reps =
-                        (b.getShort(26).toInt() and 65535).takeIf {
-                            it != 65535 && fresh && flags and 16 == 0
-                        },
+                    reps = deviceReps,
+                    deviceReps = deviceReps,
                     fitnessMode = fitnessMode,
                     fresh = fresh,
                     pending = flags and 4 != 0,

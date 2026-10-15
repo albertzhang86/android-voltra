@@ -35,6 +35,12 @@ interface VoltraController : AutoCloseable {
     /** Establish an app set boundary without sending a load/unload command to the motor. */
     fun beginSet()
 
+    /**
+     * Notify the connector that the app set finished. This is a lifecycle hook, never a motor
+     * load/unload command. Real connectors need no action; demos may stop their simulated set.
+     */
+    fun endSet() = Unit
+
     override fun close()
 }
 

@@ -51,6 +51,7 @@ class DirectVoltraController(
         var modeAt: Long? = null
         var forceAt: Long? = null
         var forceWeightLb: Double? = null
+        var cableVelocityMmPerSecond: Int? = null
         var runtimeWeightAt: Long? = null
         var runtimeWeightLb: Double? = null
         var targetAt: Long? = null
@@ -115,19 +116,25 @@ class DirectVoltraController(
                                 val now = monotonicMillis()
                                 change(entry) {
                                     val weight = activeReading(entry, now)
+                                    val fresh =
+                                        listOf(entry.statusAt, entry.modeAt).all { at ->
+                                            at != null && now - at <= 3500
+                                        }
                                     it.copy(
-                                        fresh =
-                                            listOf(entry.statusAt, entry.modeAt).all { at ->
-                                                at != null && now - at <= 3500
-                                            },
+                                        fresh = fresh,
+                                        deviceReps = it.deviceReps.takeIf { fresh },
                                         twinStatusKnown =
                                             endpointFresh(entry) &&
                                                 entry.endpoint?.topologyKnown == true,
                                         activeWeightLb = weight?.pounds,
                                         activeWeightSource = weight?.source,
                                         measuredForceLb = freshForce(entry, now),
+                                        cableMoving = freshCableMoving(entry, now),
                                         runtimeWireWeightLb = freshRuntimeWeight(entry, now),
-                                        resistanceTargetLb = weight?.pounds.takeIf { weight?.source == ActiveWeightSource.TARGET_FORCE },
+                                        resistanceTargetLb =
+                                            weight?.pounds.takeIf {
+                                                weight?.source == ActiveWeightSource.TARGET_FORCE
+                                            },
                                         parameters =
                                             it.parameters.filterKeys { parameter ->
                                                 entry.parameterAt[parameter]?.let {
@@ -240,10 +247,12 @@ class DirectVoltraController(
         if (!telemetryAvailable(entry, now, nextMode)) {
             clearActiveWeight(entry)
         } else if (update.cableForceLb != null) {
-            // Out-of-range readback explicitly invalidates prior force; an invalid sample
-            // must not keep an older reading alive or override the runtime fallback.
+            // Force and motion must come from one notification. A legacy force-only sample
+            // clears motion, so it cannot borrow a previous B4 velocity.
             entry.forceWeightLb = update.cableForceLb?.takeIf { it in 0.0..1000.0 }
             entry.forceAt = now.takeIf { entry.forceWeightLb != null }
+            entry.cableVelocityMmPerSecond =
+                update.cableVelocityMmPerSecond.takeIf { entry.forceWeightLb != null }
         }
         if (
             telemetryAvailable(entry, now, nextMode) &&
@@ -255,9 +264,12 @@ class DirectVoltraController(
             entry.runtimeWeightAt = now.takeIf { entry.runtimeWeightLb != null }
         }
         if (update.resistanceTargetReported) {
-            entry.targetWeightLb = update.resistanceTargetLb?.takeIf {
-                it in 0.0..1000.0 && telemetryAvailable(entry, now, nextMode) && nextFitness in listOf(5, 21)
-            }
+            entry.targetWeightLb =
+                update.resistanceTargetLb?.takeIf {
+                    it in 0.0..1000.0 &&
+                        telemetryAvailable(entry, now, nextMode) &&
+                        nextFitness in listOf(5, 21)
+                }
             entry.targetAt = now.takeIf { entry.targetWeightLb != null }
         }
         var repAccepted = false
@@ -294,6 +306,7 @@ class DirectVoltraController(
                     ?: (update.registers[VoltraProtocol.TWIN_STATUS]?.let { it == 2 }
                         ?: old.twinReported)
             val weight = activeReading(entry, now, twinReported, nextMode, nextFitness)
+            val fresh = listOf(entry.statusAt, entry.modeAt).all { it != null && now - it <= 3500 }
             old.copy(
                 parameters = parameters,
                 mode = nextMode,
@@ -311,13 +324,18 @@ class DirectVoltraController(
                 activeWeightLb = weight?.pounds,
                 activeWeightSource = weight?.source,
                 measuredForceLb = freshForce(entry, now, nextMode),
+                cableMoving = freshCableMoving(entry, now, nextMode, nextFitness),
                 runtimeWireWeightLb = freshRuntimeWeight(entry, now, nextMode),
-                resistanceTargetLb = weight?.pounds.takeIf { weight?.source == ActiveWeightSource.TARGET_FORCE },
+                resistanceTargetLb =
+                    weight?.pounds.takeIf { weight?.source == ActiveWeightSource.TARGET_FORCE },
                 reps =
                     if (twinReported) null
                     else if (repAccepted) (entry.lastRep - entry.repBaseline).coerceAtLeast(0)
                     else old.reps,
-                fresh = listOf(entry.statusAt, entry.modeAt).all { it != null && now - it <= 3500 },
+                deviceReps =
+                    if (twinReported || !fresh) null
+                    else if (repAccepted) entry.lastRep else old.deviceReps,
+                fresh = fresh,
             )
         }
     }
@@ -600,18 +618,43 @@ class DirectVoltraController(
         if (fitnessMode == 4) return ActiveReading(0.0, ActiveWeightSource.UNLOADED)
         if (fitnessMode !in listOf(5, 21)) return null
         if (entry.targetAt?.let { now - it <= 1500 } == true)
-            entry.targetWeightLb?.let { return ActiveReading(it, ActiveWeightSource.TARGET_FORCE) }
+            entry.targetWeightLb?.let {
+                return ActiveReading(it, ActiveWeightSource.TARGET_FORCE)
+            }
         return null
     }
 
-    private fun freshForce(entry: Entry, now: Long, mode: TrainingMode? = entry.snapshot.mode): Double? =
+    private fun freshForce(
+        entry: Entry,
+        now: Long,
+        mode: TrainingMode? = entry.snapshot.mode,
+    ): Double? =
         entry.forceWeightLb.takeIf {
             telemetryAvailable(entry, now, mode) && entry.forceAt?.let { now - it <= 1500 } == true
         }
 
-    private fun freshRuntimeWeight(entry: Entry, now: Long, mode: TrainingMode? = entry.snapshot.mode): Double? =
+    private fun freshCableMoving(
+        entry: Entry,
+        now: Long,
+        mode: TrainingMode? = entry.snapshot.mode,
+        fitnessMode: Int? = entry.snapshot.fitnessMode,
+    ): Boolean? {
+        if (fitnessMode !in listOf(5, 21) || !telemetryAvailable(entry, now, mode)) return null
+        if (entry.forceWeightLb == null || entry.forceAt?.let { now - it <= 500 } != true)
+            return null
+        // A small deadband avoids treating stationary sensor noise as a pull. Both
+        // directions count; position alone cannot distinguish a hold from movement.
+        return entry.cableVelocityMmPerSecond?.let { kotlin.math.abs(it) >= 10 }
+    }
+
+    private fun freshRuntimeWeight(
+        entry: Entry,
+        now: Long,
+        mode: TrainingMode? = entry.snapshot.mode,
+    ): Double? =
         entry.runtimeWeightLb.takeIf {
-            telemetryAvailable(entry, now, mode) && entry.runtimeWeightAt?.let { now - it <= 1500 } == true
+            telemetryAvailable(entry, now, mode) &&
+                entry.runtimeWeightAt?.let { now - it <= 1500 } == true
         }
 
     private fun telemetryAvailable(
@@ -630,6 +673,7 @@ class DirectVoltraController(
     private fun clearActiveWeight(entry: Entry) {
         entry.forceAt = null
         entry.forceWeightLb = null
+        entry.cableVelocityMmPerSecond = null
         entry.runtimeWeightAt = null
         entry.runtimeWeightLb = null
         entry.targetAt = null
@@ -642,8 +686,15 @@ class DirectVoltraController(
             entries.values
                 .map {
                     if (twinPending)
-                        it.snapshot.copy(activeWeightLb = null, activeWeightSource = null,
-                            measuredForceLb = null, runtimeWireWeightLb = null, resistanceTargetLb = null)
+                        it.snapshot.copy(
+                            activeWeightLb = null,
+                            activeWeightSource = null,
+                            measuredForceLb = null,
+                            runtimeWireWeightLb = null,
+                            resistanceTargetLb = null,
+                            cableMoving = null,
+                            deviceReps = null,
+                        )
                     else it.snapshot
                 }
                 .toMutableList()
@@ -667,9 +718,11 @@ class DirectVoltraController(
                         activeWeightLb = null,
                         activeWeightSource = null,
                         measuredForceLb = null,
+                        cableMoving = null,
                         runtimeWireWeightLb = null,
                         resistanceTargetLb = null,
                         reps = null,
+                        deviceReps = null,
                     )
                 val peer =
                     TrainerState(
@@ -717,9 +770,11 @@ class DirectVoltraController(
                 activeWeightLb = null,
                 activeWeightSource = null,
                 measuredForceLb = null,
+                cableMoving = null,
                 runtimeWireWeightLb = null,
                 resistanceTargetLb = null,
                 reps = null,
+                deviceReps = null,
                 pending = false,
                 error = error.message ?: "VOLTRA connection failed.",
             )

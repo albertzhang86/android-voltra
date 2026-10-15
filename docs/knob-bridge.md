@@ -83,9 +83,9 @@ uses kg; other modes follow its reported unit setting). These flags do not chang
 the raw parameter or force units. Older readers ignore them and packet lengths
 remain unchanged. `TrainerState.weightUnit` exposes the preference to consumers.
 Bit 4 of byte 133 identifies legacy runtime wire-weight telemetry (`0x3e83`);
-with bits 4 and 6 clear, offset 22 is legacy measured cable force. These values
+with bits 4, 6 and 7 clear, offset 22 is legacy measured cable force. These values
 populate `runtimeWireWeightLb` or `measuredForceLb`, never active resistance.
-Bit 6 identifies target resistance at offset 22. Bits 4 and 6 are mutually
+Bit 6 identifies target resistance at offset 22. Bits 4, 6 and 7 are mutually
 exclusive. Fresh fitness 4 gives active weight zero with source `UNLOADED`;
 fresh fitness 5/21 permits a nonnegative bit-6 reading as `resistanceTargetLb`
 and `activeWeightLb`, source `TARGET_FORCE`. Missing target, unknown state,
@@ -94,6 +94,15 @@ bit 6 for explicit unloaded zero as well. Older firmware stays readable without
 mislabeling its measured tension. No source is replaced by configured base weight.
 The B4 optional target's protocol mapping is verified; its correspondence to the
 trainer's displayed resistance under modifiers still needs physical validation.
+Bit 7 identifies measured cable force during confirmed loaded movement at offset
+22. It sets `measuredForceLb` and `cableMoving = true` only with fresh independent
+identity, a known mode and loaded fitness 5/21; it never creates a target reading.
+Without bit 7, motion is unknown, including older force-only snapshots. The knob
+prioritizes this moving sample, otherwise publishes its existing target/unloaded
+reading. Source values are never combined. The reader clears movement after
+500 ms without a snapshot, independently of the 2-second bridge status timeout.
+The version and packet length remain unchanged; older readers see bit-7 data as
+measured force and do not mistake it for a resistance target.
 Bit 5 indicates detected USB-host power for the knob, independently of trainer
 selection or battery percentage. `KnobState.usbPowerConnected` exposes it. A
 lightning battery icon can replace an unavailable percentage, but this flag does

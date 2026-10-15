@@ -129,8 +129,12 @@ data class ProtocolUpdate(
     val resistanceTargetLb: Double? = null,
     /** True for B4, including packets where the optional target is absent or invalid. */
     val resistanceTargetReported: Boolean = false,
+    /** Independent B4 motion from the same notification as cableForceLb. */
+    val cableVelocityMmPerSecond: Int? = null,
+    val cableLengthMm: Int? = null,
 ) {
-    val cableForceLb: Double? get() = activeWeightLb
+    val cableForceLb: Double?
+        get() = activeWeightLb
 }
 
 object VoltraDecoder {
@@ -163,14 +167,22 @@ object VoltraDecoder {
                 activeWeightLb = u(11, 2) / 10.0,
                 resistanceTargetLb = target?.takeIf { it in 0..10000 }?.div(10.0),
                 resistanceTargetReported = true,
+                cableVelocityMmPerSecond = u(15, 2).toShort().toInt(),
+                cableLengthMm = u(13, 2),
             )
         }
         if (frame.size == 58 && u(2) == 4 && u(10) == 0xaa && u(11) == 0x81 && u(12) == 0x2b) {
             return ProtocolUpdate(activeWeightLb = u(22, 2) / 10.0)
         }
         if (u(10) == 0xaa) {
-            if (frame.size == 74 && u(11) == 0x82 && u(12) == 0x3b && u(13) == 1) {
-                return ProtocolUpdate(deviceSet = u(15, 2), rep = u(17, 2))
+            // Hardware reports pull indices from zero, but return counts from one:
+            // pull 0 / return 1 describe the first rep. Normalize only the pull phase;
+            // the controller deduplicates counts instead of counting notifications.
+            if (frame.size == 74 && u(11) == 0x82 && u(12) == 0x3b && u(13) in 1..2) {
+                return ProtocolUpdate(
+                    deviceSet = u(15, 2),
+                    rep = u(17, 2) + if (u(13) == 1) 1 else 0,
+                )
             }
             return null // Other vendor packets can share lengths with battery messages.
         }

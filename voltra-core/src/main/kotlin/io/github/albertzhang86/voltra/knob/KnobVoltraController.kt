@@ -18,6 +18,7 @@ class KnobVoltraController(
     private val job = SupervisorJob(parentScope.coroutineContext[Job])
     private val scope = CoroutineScope(parentScope.coroutineContext + job)
     private var rememberedDevice = rememberedDevice
+    private var telemetryEpoch = 0L
     private val mutableState = MutableStateFlow(disconnectedState())
     override val state = mutableState.asStateFlow()
     private val commands = Mutex()
@@ -29,6 +30,8 @@ class KnobVoltraController(
     private var receivedAt = 0L
     private var nextId = 1
     private var baseline: Int? = null
+    private var waitingForFirstRep = false
+    private var repTrainerId: String? = null
     private var pending: Pending? = null
     private var generation = 0
 
@@ -43,6 +46,11 @@ class KnobVoltraController(
         scope.launch {
             while (isActive) {
                 delay(250)
+                if (snapshot != null && now() - receivedAt > 500) {
+                    mutableState.update { state ->
+                        state.copy(trainers = state.trainers.map { it.copy(cableMoving = null) })
+                    }
+                }
                 if (snapshot != null && now() - receivedAt > 2000) {
                     mutableState.update {
                         it.copy(
@@ -52,11 +60,12 @@ class KnobVoltraController(
                                     activeWeightLb = null,
                                     reps = null,
                                 ),
-                            knob = it.knob?.copy(
-                                twinCandidate = null,
-                                twinExitAllowed = false,
-                                usbPowerConnected = false,
-                            ),
+                            knob =
+                                it.knob?.copy(
+                                    twinCandidate = null,
+                                    twinExitAllowed = false,
+                                    usbPowerConnected = false,
+                                ),
                             trainers =
                                 it.trainers.map { trainer ->
                                     trainer.copy(
@@ -64,9 +73,11 @@ class KnobVoltraController(
                                         activeWeightLb = null,
                                         activeWeightSource = null,
                                         measuredForceLb = null,
+                                        cableMoving = null,
                                         runtimeWireWeightLb = null,
                                         resistanceTargetLb = null,
                                         reps = null,
+                                        deviceReps = null,
                                     )
                                 },
                         )
@@ -95,7 +106,11 @@ class KnobVoltraController(
         }
         val token = ++generation
         mutableState.value =
-            VoltraState(knob = KnobState(device, ConnectionStatus.CONNECTING), viaKnob = true)
+            VoltraState(
+                knob = KnobState(device, ConnectionStatus.CONNECTING),
+                viaKnob = true,
+                telemetryEpoch = telemetryEpoch,
+            )
         connection =
             scope.launch {
                 var opened: VoltraLink? = null
@@ -182,16 +197,20 @@ class KnobVoltraController(
 
     private fun failConnection(token: Int, failure: Exception) {
         if (generation != token) return
+        telemetryEpoch++
         pending?.completion?.completeExceptionally(failure)
         snapshot = null
         snapshots.value = null
         baseline = null
+        waitingForFirstRep = false
+        repTrainerId = null
         mutableState.update {
             it.copy(
                 trainers = emptyList(),
                 twin = null,
                 twinPending = false,
                 twinSupported = false,
+                telemetryEpoch = telemetryEpoch,
                 knob =
                     it.knob?.copy(
                         status = ConnectionStatus.FAILED,
@@ -207,13 +226,25 @@ class KnobVoltraController(
 
     private fun receive(update: KnobProtocol.Snapshot) {
         val old = snapshot
+        val trainerId = update.trainer?.device?.id
+        if (
+            old != null &&
+                (update.epoch != old.epoch ||
+                    update.session != old.session ||
+                    (trainerId != null && repTrainerId != null && trainerId != repTrainerId))
+        ) {
+            telemetryEpoch++
+            baseline = null
+            waitingForFirstRep = false
+            repTrainerId = null
+        }
+        if (trainerId != null) repTrainerId = trainerId
         if (
             old == null ||
                 update.epoch != old.epoch ||
                 update.session != old.session ||
                 update.trainer?.device?.id != old.trainer?.device?.id
         ) {
-            baseline = update.trainer?.reps
             pending
                 ?.completion
                 ?.completeExceptionally(
@@ -227,11 +258,20 @@ class KnobVoltraController(
         receivedAt = now()
         val trainer =
             update.trainer?.let { trainer ->
-                val raw = trainer.reps
-                if (raw != null && (baseline == null || raw < requireNotNull(baseline)))
-                    baseline = raw
+                val raw = trainer.deviceReps.takeIf { trainer.connected && trainer.fresh }
+                if (raw != null) {
+                    if (waitingForFirstRep) {
+                        // An explicitly started set without a reading must include its first rep.
+                        baseline = (raw - 1).coerceAtLeast(0)
+                        waitingForFirstRep = false
+                    } else if (baseline != null && raw < requireNotNull(baseline)) {
+                        // The trainer reset its counter; mirror the new count from zero.
+                        baseline = 0
+                    }
+                }
                 trainer.copy(
-                    reps = raw?.let { (it - (baseline ?: it)).coerceAtLeast(0) },
+                    reps = raw?.let { (it - (baseline ?: 0)).coerceAtLeast(0) },
+                    deviceReps = raw,
                     pending = trainer.pending || pending != null,
                 )
             }
@@ -247,9 +287,11 @@ class KnobVoltraController(
                             activeWeightLb = null,
                             activeWeightSource = null,
                             measuredForceLb = null,
+                            cableMoving = null,
                             runtimeWireWeightLb = null,
                             resistanceTargetLb = null,
                             reps = null,
+                            deviceReps = null,
                             editableParameters = emptySet(),
                             modeChangeAllowed = false,
                         )
@@ -267,6 +309,7 @@ class KnobVoltraController(
             it.copy(
                 twin = pair,
                 twinSupported = update.version == 2,
+                telemetryEpoch = telemetryEpoch,
                 trainers = listOfNotNull(trainer, peer),
                 knob =
                     it.knob?.copy(
@@ -288,6 +331,7 @@ class KnobVoltraController(
         )
             return
         ++generation
+        telemetryEpoch++
         connection?.cancel()
         connection = null
         commandJobs.toList().forEach { it.cancel() }
@@ -298,6 +342,8 @@ class KnobVoltraController(
         snapshot = null
         snapshots.value = null
         baseline = null
+        waitingForFirstRep = false
+        repTrainerId = null
         nextId = 1
         mutableState.value = disconnectedState()
     }
@@ -306,6 +352,7 @@ class KnobVoltraController(
         VoltraState(
             viaKnob = true,
             knob = rememberedDevice?.let { KnobState(it, ConnectionStatus.DISCONNECTED) },
+            telemetryEpoch = telemetryEpoch,
         )
 
     override fun forget(deviceId: String) {
@@ -449,11 +496,22 @@ class KnobVoltraController(
     }
 
     override fun beginSet() {
-        baseline = snapshot?.trainer?.reps ?: 0
+        val freshTrainer =
+            snapshot?.trainer?.takeIf { it.connected && it.fresh && now() - receivedAt <= 2000 }
+        baseline = freshTrainer?.deviceReps ?: 0
+        waitingForFirstRep = freshTrainer?.deviceReps == null
         mutableState.update {
             it.copy(
                 trainers =
-                    it.trainers.map { trainer -> trainer.copy(reps = trainer.reps?.let { 0 }) }
+                    it.trainers.map { trainer ->
+                        trainer.copy(
+                            reps =
+                                freshTrainer
+                                    ?.deviceReps
+                                    ?.let { 0 }
+                                    .takeIf { trainer.device.id == freshTrainer?.device?.id }
+                        )
+                    }
             )
         }
     }

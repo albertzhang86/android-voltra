@@ -125,6 +125,10 @@ data class TrainerState(
     val runtimeWireWeightLb: Double? = null,
     /** Fresh B4 target while explicitly loaded; never inferred from the base setting. */
     val resistanceTargetLb: Double? = null,
+    /** Fresh loaded cable motion paired with measured force; null when not classified. */
+    val cableMoving: Boolean? = null,
+    /** Confirmed trainer count, never rebased by app beginSet; null when unavailable or stale. */
+    val deviceReps: Int? = null,
 ) {
     val connected
         get() = status == ConnectionStatus.READY
@@ -191,6 +195,8 @@ data class VoltraState(
     val isSimulated: Boolean = false,
     val knob: KnobState? = null,
     val viaKnob: Boolean = false,
+    /** Monotonic within a controller when device telemetry continuity resets; not app beginSet. */
+    val telemetryEpoch: Long = 0,
 ) {
     val canCreateTwin: Boolean
         get() =
