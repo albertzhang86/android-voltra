@@ -17,6 +17,13 @@ interface VoltraController : AutoCloseable {
 
     fun disconnect(deviceId: String)
 
+    /**
+     * Disconnect and discard this client's remembered device and readings. Does not change load,
+     * hardware Twin mode, or the operating system's Bluetooth bond. A knob route can forget the
+     * knob itself; trainer identities owned by the knob must be managed on the knob.
+     */
+    fun forget(deviceId: String) = disconnect(deviceId)
+
     suspend fun setMode(deviceId: String, mode: TrainingMode)
 
     suspend fun setParameter(deviceId: String, parameter: Parameter, value: Int)

@@ -7,8 +7,9 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 /**
- * Two independent connections with per-device command confirmation and freshness. Call lifecycle
- * methods on the owning dispatcher. No command is replayed after a disconnect.
+ * Up to two independent connections, or one native Twin controller session. Commands require device
+ * confirmation and fresh state. Lifecycle methods use the owning dispatcher; a disconnect never
+ * replays a command.
  */
 class DirectVoltraController(
     private val transport: VoltraTransport,
@@ -18,21 +19,42 @@ class DirectVoltraController(
 ) : VoltraController {
     private val ownerJob = SupervisorJob(parentScope.coroutineContext[Job])
     private val scope = CoroutineScope(parentScope.coroutineContext + ownerJob)
-    private val mutableState = MutableStateFlow(VoltraState())
+    private val mutableState = MutableStateFlow(VoltraState(twinSupported = true))
     override val state = mutableState.asStateFlow()
     private val entries = mutableMapOf<String, Entry>()
     private var closed = false
+    private val twinCommands = Mutex()
+    private val knownDevices = mutableMapOf<String, VoltraDevice>()
+    private var nativePair: NativePair? = null
+    private var twinPending = false
+    private var twinOperation: Job? = null
+    private var twinOperationIds = emptySet<String>()
+    private var connectionGeneration = 0
+    private var sequence = 0
+
+    private data class NativePair(val controllerId: String, val peer: VoltraDevice)
 
     private class Entry(val device: VoltraDevice) {
+        var snapshot = TrainerState(device)
+        var endpoint: EndpointStatus? = null
+        var endpointAt: Long? = null
+        var expectedTwinDisconnect = false
+        var twinReply: CompletableDeferred<TwinCommandReply>? = null
+        var twinSequence = -1
         var link: VoltraLink? = null
         var job: Job? = null
         val commands = Mutex()
+        val commandJobs = mutableSetOf<Job>()
         val revisions = mutableMapOf<Int, Long>()
         val parameterAt = mutableMapOf<Parameter, Long>()
         var statusAt: Long? = null
         var modeAt: Long? = null
-        var twinAt: Long? = null
         var forceAt: Long? = null
+        var forceWeightLb: Double? = null
+        var runtimeWeightAt: Long? = null
+        var runtimeWeightLb: Double? = null
+        var targetAt: Long? = null
+        var targetWeightLb: Double? = null
         var deviceSet: Int? = null
         var lastRep = 0
         var repBaseline = 0
@@ -41,23 +63,19 @@ class DirectVoltraController(
 
     override fun scan(): Flow<List<VoltraDevice>> = flow {
         check(!closed) { "Controller is closed." }
-        emitAll(transport.scan())
+        emitAll(transport.scan().onEach { devices -> devices.forEach { knownDevices[it.id] = it } })
     }
 
     override suspend fun connect(device: VoltraDevice) =
         withContext(scope.coroutineContext) {
             check(!closed)
             check(entries[device.id] == null) { "This trainer is already connected." }
+            check(state.value.twin == null) { "Exit Twin mode before connecting another trainer." }
             check(entries.size < 2) { "Disconnect a trainer before adding another." }
+            knownDevices[device.id] = device
             val entry = Entry(device)
             entries[device.id] = entry
-            mutableState.update {
-                it.copy(
-                    trainers =
-                        it.trainers.filterNot { old -> old.device.id == device.id } +
-                            TrainerState(device)
-                )
-            }
+            publish()
             entry.job =
                 scope.launch {
                     try {
@@ -96,18 +114,20 @@ class DirectVoltraController(
                             while (isActive) {
                                 val now = monotonicMillis()
                                 change(entry) {
+                                    val weight = activeReading(entry, now)
                                     it.copy(
                                         fresh =
                                             listOf(entry.statusAt, entry.modeAt).all { at ->
                                                 at != null && now - at <= 3500
                                             },
                                         twinStatusKnown =
-                                            entry.twinAt?.let { now - it <= 3500 } == true,
-                                        activeWeightLb =
-                                            it.activeWeightLb.takeIf {
-                                                entry.forceAt?.let { at -> now - at <= 1500 } ==
-                                                    true
-                                            },
+                                            endpointFresh(entry) &&
+                                                entry.endpoint?.topologyKnown == true,
+                                        activeWeightLb = weight?.pounds,
+                                        activeWeightSource = weight?.source,
+                                        measuredForceLb = freshForce(entry, now),
+                                        runtimeWireWeightLb = freshRuntimeWeight(entry, now),
+                                        resistanceTargetLb = weight?.pounds.takeIf { weight?.source == ActiveWeightSource.TARGET_FORCE },
                                         parameters =
                                             it.parameters.filterKeys { parameter ->
                                                 entry.parameterAt[parameter]?.let {
@@ -120,6 +140,14 @@ class DirectVoltraController(
                                     poll(entry)
                                     lastPoll = now
                                 }
+                                // Keep coarse wire tension as separate telemetry; it is never
+                                // a fallback for resistance. Do not poll native Twin endpoints.
+                                if (telemetryAvailable(entry, monotonicMillis())) {
+                                    requireNotNull(entry.link)
+                                        .write(
+                                            VoltraProtocol.read(VoltraProtocol.RUNTIME_WIRE_WEIGHT)
+                                        )
+                                }
                                 if (entry.statusAt?.let { now - it > 10_000 } == true)
                                     error("VOLTRA stopped reporting status. Reconnect to continue.")
                                 delay(250)
@@ -129,7 +157,7 @@ class DirectVoltraController(
                         fail(
                             entry,
                             Exception(
-                                "VOLTRA connection timed out. Accept the connection on the trainer and retry."
+                                "VOLTRA connection timed out. If connected to Cortex, Beyond+ or a knob, disconnect it there, then retry."
                             ),
                         )
                     } catch (cancelled: CancellationException) {
@@ -138,7 +166,10 @@ class DirectVoltraController(
                         fail(entry, failure)
                     } finally {
                         entry.link?.close()
-                        if (entries[device.id] === entry) entries.remove(device.id)
+                        if (entry.expectedTwinDisconnect && entries[device.id] === entry) {
+                            entries.remove(device.id)
+                            publish()
+                        }
                     }
                 }
         }
@@ -149,7 +180,8 @@ class DirectVoltraController(
         link.write(VoltraProtocol.read(VoltraProtocol.FITNESS))
         // Single-register reads avoid assuming different firmware versions share parameter widths.
         link.write(VoltraProtocol.read(VoltraProtocol.BATTERY))
-        link.write(VoltraProtocol.read(VoltraProtocol.TWIN_STATUS))
+        link.write(VoltraProtocol.read(VoltraProtocol.WEIGHT_UNIT))
+        link.write(VoltraProtocol.endpointStatus())
         Parameter.forMode(current(entry)?.mode).forEach {
             link.write(VoltraProtocol.read(it.register))
         }
@@ -158,11 +190,76 @@ class DirectVoltraController(
     private fun update(entry: Entry, update: ProtocolUpdate) {
         if (entries[entry.device.id] !== entry) return
         val now = monotonicMillis()
+        val nextMode =
+            if (VoltraProtocol.MODE in update.registers) {
+                TrainingMode.fromWire(update.registers.getValue(VoltraProtocol.MODE))
+            } else entry.snapshot.mode
+        val nextFitness = update.registers[VoltraProtocol.FITNESS] ?: entry.snapshot.fitnessMode
+        if (
+            (VoltraProtocol.MODE in update.registers && nextMode != entry.snapshot.mode) ||
+                (VoltraProtocol.FITNESS in update.registers &&
+                    update.registers[VoltraProtocol.FITNESS] != entry.snapshot.fitnessMode)
+        ) {
+            clearActiveWeight(entry)
+        }
         update.registers.keys.forEach { entry.revisions[it] = (entry.revisions[it] ?: 0) + 1 }
         if (VoltraProtocol.FITNESS in update.registers) entry.statusAt = now
         if (VoltraProtocol.MODE in update.registers) entry.modeAt = now
-        if (VoltraProtocol.TWIN_STATUS in update.registers) entry.twinAt = now
-        if (update.activeWeightLb != null) entry.forceAt = now
+        update.twinReply
+            ?.takeIf { it.sequence == entry.twinSequence }
+            ?.let { entry.twinReply?.complete(it) }
+        update.endpoint?.let { endpoint ->
+            // Android IDs are MAC addresses. Opaque transport IDs remain supported for other hosts.
+            val addressId = entry.device.id.matches(Regex("[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}"))
+            if (addressId && !entry.device.id.equals(endpoint.localAddress, ignoreCase = true))
+                return
+            knownDevices[endpoint.localAddress] = entry.device
+            val previous = entry.endpoint
+            if (
+                !endpointFresh(entry) ||
+                    previous?.localAddress != endpoint.localAddress ||
+                    previous.peerAddress != endpoint.peerAddress ||
+                    previous.pairingStatus != endpoint.pairingStatus
+            ) {
+                clearActiveWeight(entry)
+            }
+            entry.endpoint = endpoint
+            entry.endpointAt = now
+            if (endpoint.paired) {
+                val peer =
+                    entries.values
+                        .firstOrNull { it.endpoint?.localAddress == endpoint.peerAddress }
+                        ?.device
+                        ?: knownDevices[endpoint.peerAddress]
+                        ?: VoltraDevice(endpoint.peerAddress, "VOLTRA peer")
+                nativePair = NativePair(entry.device.id, peer)
+            } else if (endpoint.independent && nativePair?.controllerId == entry.device.id) {
+                nativePair = null
+            }
+        }
+        if (!telemetryAvailable(entry, now, nextMode)) {
+            clearActiveWeight(entry)
+        } else if (update.cableForceLb != null) {
+            // Out-of-range readback explicitly invalidates prior force; an invalid sample
+            // must not keep an older reading alive or override the runtime fallback.
+            entry.forceWeightLb = update.cableForceLb?.takeIf { it in 0.0..1000.0 }
+            entry.forceAt = now.takeIf { entry.forceWeightLb != null }
+        }
+        if (
+            telemetryAvailable(entry, now, nextMode) &&
+                VoltraProtocol.RUNTIME_WIRE_WEIGHT in update.registers
+        ) {
+            // Negative signed values and out-of-range data are unavailable, never a huge
+            // unsigned weight. Invalid readback also clears any previous runtime value.
+            entry.runtimeWeightLb = update.runtimeWeightLb?.takeIf { it in 0.0..1000.0 }
+            entry.runtimeWeightAt = now.takeIf { entry.runtimeWeightLb != null }
+        }
+        if (update.resistanceTargetReported) {
+            entry.targetWeightLb = update.resistanceTargetLb?.takeIf {
+                it in 0.0..1000.0 && telemetryAvailable(entry, now, nextMode) && nextFitness in listOf(5, 21)
+            }
+            entry.targetAt = now.takeIf { entry.targetWeightLb != null }
+        }
         var repAccepted = false
         if (update.deviceSet != null && update.rep != null) {
             val previousSet = entry.deviceSet
@@ -193,21 +290,29 @@ class DirectVoltraController(
                 }
             }
             val twinReported =
-                update.registers[VoltraProtocol.TWIN_STATUS]?.let { it == 2 } ?: old.twinReported
+                entry.endpoint?.let { !it.independent }
+                    ?: (update.registers[VoltraProtocol.TWIN_STATUS]?.let { it == 2 }
+                        ?: old.twinReported)
+            val weight = activeReading(entry, now, twinReported, nextMode, nextFitness)
             old.copy(
                 parameters = parameters,
-                mode =
-                    if (VoltraProtocol.MODE in update.registers)
-                        TrainingMode.fromWire(update.registers.getValue(VoltraProtocol.MODE))
-                    else old.mode,
+                mode = nextMode,
                 fitnessMode = update.registers[VoltraProtocol.FITNESS] ?: old.fitnessMode,
+                weightUnit =
+                    if (VoltraProtocol.WEIGHT_UNIT in update.registers)
+                        WeightUnit.fromWire(update.registers.getValue(VoltraProtocol.WEIGHT_UNIT))
+                    else old.weightUnit,
                 batteryPercent =
-                    update.registers[VoltraProtocol.BATTERY]?.takeIf { it in 0..100 }
+                    update.endpoint?.localBatteryPercent
+                        ?: update.registers[VoltraProtocol.BATTERY]?.takeIf { it in 0..100 }
                         ?: old.batteryPercent,
                 twinReported = twinReported,
-                twinStatusKnown = entry.twinAt?.let { now - it <= 3500 } == true,
-                activeWeightLb =
-                    if (twinReported) null else update.activeWeightLb ?: old.activeWeightLb,
+                twinStatusKnown = endpointFresh(entry) && entry.endpoint?.topologyKnown == true,
+                activeWeightLb = weight?.pounds,
+                activeWeightSource = weight?.source,
+                measuredForceLb = freshForce(entry, now, nextMode),
+                runtimeWireWeightLb = freshRuntimeWeight(entry, now, nextMode),
+                resistanceTargetLb = weight?.pounds.takeIf { weight?.source == ActiveWeightSource.TARGET_FORCE },
                 reps =
                     if (twinReported) null
                     else if (repAccepted) (entry.lastRep - entry.repBaseline).coerceAtLeast(0)
@@ -251,7 +356,24 @@ class DirectVoltraController(
     private suspend fun command(deviceId: String, block: suspend (Entry) -> Unit) =
         withContext(scope.coroutineContext) {
             val entry = requireNotNull(entries[deviceId]) { "Connect VOLTRA first." }
-            entry.commands.withLock { block(entry) }
+            val operation = currentCoroutineContext().job
+            entry.commandJobs += operation
+            try {
+                entry.commands.withLock {
+                    check(entries[deviceId] === entry) { "VOLTRA disconnected." }
+                    check(!twinPending) { "Wait for the Twin change to finish." }
+                    val pair = state.value.twin
+                    check(
+                        pair == null ||
+                            (pair.controllerId == deviceId && pair.health == TwinHealth.READY)
+                    ) {
+                        "A fresh Twin controller connection is required."
+                    }
+                    block(entry)
+                }
+            } finally {
+                entry.commandJobs -= operation
+            }
         }
 
     private suspend fun confirmedWrite(
@@ -281,12 +403,121 @@ class DirectVoltraController(
         }
     }
 
-    // Native Twin uses a separate protocol/telemetry schema. Do not emulate it with two writes.
     override suspend fun createTwin(controllerId: String, peerId: String): Unit =
-        error("Native Twin pairing is not available: verified pairing commands are required.")
+        withContext(scope.coroutineContext) {
+            val generation = connectionGeneration
+            twinCommands.withLock {
+                check(generation == connectionGeneration) { "Device connections changed." }
+                check(state.value.canCreateTwin) { "Connect two idle, independent trainers first." }
+                require(controllerId != peerId)
+                val controller = requireNotNull(entries[controllerId])
+                val peer = requireNotNull(entries[peerId])
+                val controllerAddress = requireNotNull(controller.endpoint).localAddress
+                val peerAddress = requireNotNull(peer.endpoint).localAddress
+                require(controllerAddress != peerAddress)
+                val operation = currentCoroutineContext().job
+                twinOperation = operation
+                twinOperationIds = setOf(controllerId, peerId)
+                twinPending = true
+                entries.values.forEach(::clearActiveWeight)
+                publish()
+                try {
+                    // Pairing transfers the peer's connection to the controller. Its BLE
+                    // disconnect is expected; the controller must subsequently identify it.
+                    peer.expectedTwinDisconnect = true
+                    twinRequest(peer, 1, controllerAddress)
+                    withTimeout(15_000) {
+                        state.first {
+                            val pair = it.twin
+                            pair?.controllerId == controllerId &&
+                                pair.peerId == peerId &&
+                                pair.health == TwinHealth.READY &&
+                                controller.endpoint?.peerAddress == peerAddress
+                        }
+                    }
+                    entries.remove(peerId)?.let {
+                        it.job?.cancel()
+                        it.link?.close()
+                    }
+                } catch (failure: TimeoutCancellationException) {
+                    error("Twin pairing was not confirmed. Check both trainers before retrying.")
+                } finally {
+                    peer.expectedTwinDisconnect = false
+                    finishTwinOperation(operation)
+                }
+            }
+        }
 
-    override suspend fun exitTwin(): Unit =
-        error("Native Twin unpairing is not available: verified unpairing commands are required.")
+    override suspend fun exitTwin() =
+        withContext(scope.coroutineContext) {
+            val generation = connectionGeneration
+            twinCommands.withLock {
+                check(generation == connectionGeneration) { "Device connections changed." }
+                check(state.value.canExitTwin) { "An idle, confirmed Twin connection is required." }
+                val pair = requireNotNull(nativePair)
+                val controller = requireNotNull(entries[pair.controllerId])
+                val endpoint = requireNotNull(controller.endpoint)
+                val previousEndpointAt = controller.endpointAt
+                val operation = currentCoroutineContext().job
+                twinOperation = operation
+                twinOperationIds = setOf(pair.controllerId, pair.peer.id)
+                twinPending = true
+                entries.values.forEach(::clearActiveWeight)
+                publish()
+                try {
+                    twinRequest(controller, 2, endpoint.peerAddress)
+                    withTimeout(15_000) {
+                        state.first {
+                            it.twin == null &&
+                                controller.endpoint?.independent == true &&
+                                controller.endpointAt != previousEndpointAt
+                        }
+                    }
+                    // Keep the operation cancellable until peer discovery/reconnect completes.
+                    // A forgotten peer must not be automatically restored by this delayed scan.
+                    if (entries[pair.peer.id] == null) {
+                        val found =
+                            withTimeoutOrNull(12_000) {
+                                transport
+                                    .scan()
+                                    .map { devices ->
+                                        devices.firstOrNull {
+                                            it.id.equals(pair.peer.id, ignoreCase = true)
+                                        }
+                                    }
+                                    .filterNotNull()
+                                    .firstOrNull()
+                            }
+                        check(found != null) {
+                            "Twin exited. Use Find VOLTRA to reconnect the second trainer."
+                        }
+                        connect(found)
+                    }
+                } catch (failure: TimeoutCancellationException) {
+                    error("Twin exit was not confirmed. Check the trainers before retrying.")
+                } finally {
+                    finishTwinOperation(operation)
+                }
+            }
+        }
+
+    private suspend fun twinRequest(entry: Entry, operation: Int, address: String) {
+        val requestSequence = (++sequence and 0xffff)
+        val reply = CompletableDeferred<TwinCommandReply>()
+        entry.twinSequence = requestSequence
+        entry.twinReply = reply
+        try {
+            requireNotNull(entry.link)
+                .write(VoltraProtocol.twinCommand(operation, address, requestSequence))
+            val result = withTimeout(5_000) { reply.await() }
+            check(result.operation == operation && result.result == 0) {
+                "VOLTRA rejected the Twin change (${result.result})."
+            }
+        } finally {
+            entry.twinReply = null
+            entry.twinSequence = -1
+        }
+    }
 
     override fun beginSet() {
         entries.values.forEach { entry ->
@@ -297,12 +528,44 @@ class DirectVoltraController(
     }
 
     override fun disconnect(deviceId: String) {
-        val entry = entries.remove(deviceId)
-        entry?.job?.cancel()
-        entry?.link?.close()
-        mutableState.update { old ->
-            old.copy(trainers = old.trainers.filterNot { it.device.id == deviceId })
+        connectionGeneration++
+        val pair = nativePair
+        val ids =
+            if (pair != null && deviceId in listOf(pair.controllerId, pair.peer.id)) {
+                nativePair = null
+                listOf(pair.controllerId, pair.peer.id)
+            } else listOf(deviceId)
+        if (ids.any { it in twinOperationIds }) {
+            twinOperation?.cancel()
+            twinOperation = null
+            twinOperationIds = emptySet()
+            twinPending = false
         }
+        ids.forEach { id ->
+            entries.remove(id)?.let {
+                it.job?.cancel()
+                it.commandJobs.toList().forEach { command -> command.cancel() }
+                it.link?.close()
+                it.twinReply?.cancel()
+            }
+        }
+        publish()
+    }
+
+    override fun forget(deviceId: String) {
+        val affected = twinOperationIds.takeIf { deviceId in it } ?: setOf(deviceId)
+        affected.forEach(::disconnect)
+        knownDevices.entries.removeAll { (address, device) ->
+            address == deviceId || device.id == deviceId
+        }
+    }
+
+    private fun finishTwinOperation(operation: Job) {
+        if (twinOperation !== operation) return
+        twinOperation = null
+        twinOperationIds = emptySet()
+        twinPending = false
+        publish()
     }
 
     override fun close() {
@@ -317,25 +580,149 @@ class DirectVoltraController(
 
     private fun change(entry: Entry, transform: (TrainerState) -> TrainerState) {
         if (entries[entry.device.id] !== entry) return
-        mutableState.update {
-            it.copy(
-                trainers =
-                    it.trainers.map { old ->
-                        if (old.device.id == entry.device.id) transform(old) else old
-                    }
-            )
-        }
+        entry.snapshot = transform(entry.snapshot)
+        publish()
     }
 
-    private fun fail(entry: Entry, error: Exception) =
+    private fun endpointFresh(entry: Entry) =
+        entry.endpointAt?.let { monotonicMillis() - it <= 3500 } == true
+
+    private data class ActiveReading(val pounds: Double, val source: ActiveWeightSource)
+
+    private fun activeReading(
+        entry: Entry,
+        now: Long,
+        twinReported: Boolean = entry.snapshot.twinReported,
+        mode: TrainingMode? = entry.snapshot.mode,
+        fitnessMode: Int? = entry.snapshot.fitnessMode,
+    ): ActiveReading? {
+        if (twinReported || !telemetryAvailable(entry, now, mode)) return null
+        if (fitnessMode == 4) return ActiveReading(0.0, ActiveWeightSource.UNLOADED)
+        if (fitnessMode !in listOf(5, 21)) return null
+        if (entry.targetAt?.let { now - it <= 1500 } == true)
+            entry.targetWeightLb?.let { return ActiveReading(it, ActiveWeightSource.TARGET_FORCE) }
+        return null
+    }
+
+    private fun freshForce(entry: Entry, now: Long, mode: TrainingMode? = entry.snapshot.mode): Double? =
+        entry.forceWeightLb.takeIf {
+            telemetryAvailable(entry, now, mode) && entry.forceAt?.let { now - it <= 1500 } == true
+        }
+
+    private fun freshRuntimeWeight(entry: Entry, now: Long, mode: TrainingMode? = entry.snapshot.mode): Double? =
+        entry.runtimeWeightLb.takeIf {
+            telemetryAvailable(entry, now, mode) && entry.runtimeWeightAt?.let { now - it <= 1500 } == true
+        }
+
+    private fun telemetryAvailable(
+        entry: Entry,
+        now: Long,
+        mode: TrainingMode? = entry.snapshot.mode,
+    ): Boolean =
+        entry.snapshot.connected &&
+            mode != null &&
+            !twinPending &&
+            listOf(entry.statusAt, entry.modeAt, entry.endpointAt).all {
+                it != null && now - it <= 3500
+            } &&
+            entry.endpoint?.independent == true
+
+    private fun clearActiveWeight(entry: Entry) {
+        entry.forceAt = null
+        entry.forceWeightLb = null
+        entry.runtimeWeightAt = null
+        entry.runtimeWeightLb = null
+        entry.targetAt = null
+        entry.targetWeightLb = null
+    }
+
+    /** A native Twin has one BLE session; the peer is reported by that controller. */
+    private fun publish() {
+        val snapshots =
+            entries.values
+                .map {
+                    if (twinPending)
+                        it.snapshot.copy(activeWeightLb = null, activeWeightSource = null,
+                            measuredForceLb = null, runtimeWireWeightLb = null, resistanceTargetLb = null)
+                    else it.snapshot
+                }
+                .toMutableList()
+        val pair = nativePair
+        val controller = pair?.let { entries[it.controllerId] }
+        val logicalPair =
+            if (pair != null && controller != null) {
+                val endpoint = controller.endpoint
+                val ready =
+                    controller.snapshot.connected &&
+                        controller.snapshot.fresh &&
+                        endpointFresh(controller) &&
+                        endpoint?.paired == true &&
+                        endpoint.peerAddress != EndpointStatus.ZERO_ADDRESS
+                val primary =
+                    controller.snapshot.copy(
+                        twinReported = true,
+                        twinStatusKnown = ready,
+                        twinVerified = ready,
+                        twinRole = TwinRole.CONTROLLER,
+                        activeWeightLb = null,
+                        activeWeightSource = null,
+                        measuredForceLb = null,
+                        runtimeWireWeightLb = null,
+                        resistanceTargetLb = null,
+                        reps = null,
+                    )
+                val peer =
+                    TrainerState(
+                        device = pair.peer,
+                        status =
+                            if (ready) ConnectionStatus.READY else ConnectionStatus.DISCONNECTED,
+                        mode = primary.mode,
+                        parameters = primary.parameters,
+                        batteryPercent = endpoint?.peerBatteryPercent,
+                        fitnessMode = primary.fitnessMode,
+                        fresh = ready,
+                        pending = primary.pending,
+                        twinReported = true,
+                        twinStatusKnown = ready,
+                        twinRole = TwinRole.PEER,
+                        twinVerified = ready,
+                        modeChangeAllowed = false,
+                        editableParameters = emptySet(),
+                    )
+                snapshots.removeAll { it.device.id in listOf(pair.controllerId, pair.peer.id) }
+                snapshots.add(0, primary)
+                snapshots.add(1, peer)
+                TwinPair(
+                    pair.controllerId,
+                    pair.peer.id,
+                    if (ready) TwinHealth.READY else TwinHealth.DEGRADED,
+                )
+            } else null
+        mutableState.value =
+            VoltraState(
+                trainers = snapshots,
+                twin = logicalPair,
+                twinPending = twinPending,
+                twinSupported = true,
+            )
+    }
+
+    private fun fail(entry: Entry, error: Exception) {
+        if (entry.expectedTwinDisconnect) return
+        entry.twinReply?.completeExceptionally(error)
         change(entry) {
             it.copy(
                 status = ConnectionStatus.FAILED,
                 fresh = false,
                 activeWeightLb = null,
+                activeWeightSource = null,
+                measuredForceLb = null,
+                runtimeWireWeightLb = null,
+                resistanceTargetLb = null,
                 reps = null,
                 pending = false,
                 error = error.message ?: "VOLTRA connection failed.",
             )
         }
+    }
 }

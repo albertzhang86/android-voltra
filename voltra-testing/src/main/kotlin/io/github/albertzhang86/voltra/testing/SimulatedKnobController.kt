@@ -4,7 +4,7 @@ import io.github.albertzhang86.voltra.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
-/** Explicit UI demo of one knob with one selected trainer, never a hardware fallback. */
+/** Explicit Twin UI demo through a knob. Never evidence of native hardware support. */
 class SimulatedKnobController(parentScope: CoroutineScope) : VoltraController {
     private val job = SupervisorJob(parentScope.coroutineContext[Job])
     private val scope = CoroutineScope(parentScope.coroutineContext + job)
@@ -14,7 +14,6 @@ class SimulatedKnobController(parentScope: CoroutineScope) : VoltraController {
             .map {
                 it.copy(
                     viaKnob = true,
-                    twinSupported = false,
                     knob =
                         if (it.trainers.isEmpty()) null
                         else KnobState(DEVICE, ConnectionStatus.READY, 78),
@@ -27,10 +26,19 @@ class SimulatedKnobController(parentScope: CoroutineScope) : VoltraController {
     override suspend fun connect(device: VoltraDevice) {
         require(device == DEVICE)
         delegate.connect(SimulatedVoltraController.devices.first())
+        delegate.connect(SimulatedVoltraController.devices.last())
     }
 
-    override fun disconnect(deviceId: String) =
-        delegate.disconnect(SimulatedVoltraController.devices.first().id)
+    override fun disconnect(deviceId: String) {
+        if (deviceId == DEVICE.id)
+            SimulatedVoltraController.devices.forEach { delegate.disconnect(it.id) }
+        else delegate.disconnect(deviceId)
+    }
+
+    override fun forget(deviceId: String) {
+        require(deviceId == DEVICE.id) { "Manage trainers on the knob." }
+        SimulatedVoltraController.devices.forEach { delegate.forget(it.id) }
+    }
 
     override suspend fun setMode(deviceId: String, mode: TrainingMode) =
         delegate.setMode(deviceId, mode)
@@ -38,10 +46,10 @@ class SimulatedKnobController(parentScope: CoroutineScope) : VoltraController {
     override suspend fun setParameter(deviceId: String, parameter: Parameter, value: Int) =
         delegate.setParameter(deviceId, parameter, value)
 
-    override suspend fun createTwin(controllerId: String, peerId: String): Unit =
-        error("Twin setup is not available through this knob.")
+    override suspend fun createTwin(controllerId: String, peerId: String) =
+        delegate.createTwin(controllerId, peerId)
 
-    override suspend fun exitTwin(): Unit = error("Exit Twin on the trainers.")
+    override suspend fun exitTwin() = delegate.exitTwin()
 
     override fun beginSet() = delegate.beginSet()
 

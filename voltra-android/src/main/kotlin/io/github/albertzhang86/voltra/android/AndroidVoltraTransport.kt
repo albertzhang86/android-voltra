@@ -31,6 +31,7 @@ internal data class GattProfile(
     val namePrefix: String? = "VTR-",
     val minimumMtu: Int = 64,
     val connectTimeoutMs: Long = 15_000,
+    val label: String = "VOLTRA",
 )
 
 /** One native GATT instance per trainer; the controller enforces the two-device limit. */
@@ -64,7 +65,10 @@ internal constructor(context: Context, private val profile: GattProfile) : Voltr
                                 )
                                     return
                                 val device =
-                                    VoltraDevice(result.device.address, name.ifBlank { "VOLTRA" })
+                                    VoltraDevice(
+                                        result.device.address,
+                                        name.ifBlank { profile.label },
+                                    )
                                 synchronized(found) {
                                     found[device.id] = device
                                     trySend(found.values.toList())
@@ -110,7 +114,7 @@ internal constructor(context: Context, private val profile: GattProfile) : Voltr
         withContext(Dispatchers.Main.immediate) {
             VoltraBluetooth.problem(context, scanning = false)?.let { error(it) }
             require(BluetoothAdapter.checkBluetoothAddress(device.id)) {
-                "Select a discovered VOLTRA."
+                "Select a discovered ${profile.label}."
             }
             val link =
                 AndroidVoltraLink(
@@ -138,6 +142,7 @@ private class AndroidVoltraLink(
     private val incoming = Channel<ByteArray>(256)
     override val packets = incoming.receiveAsFlow()
     private val closed = AtomicBoolean()
+    private val setup = GattSetupGate()
     private val writeMutex = Mutex()
     private var writer: BluetoothGattCharacteristic? = null
     private var descriptor: BluetoothGattDescriptor? = null
@@ -150,7 +155,7 @@ private class AndroidVoltraLink(
                     status != BluetoothGatt.GATT_SUCCESS ||
                         newState == BluetoothProfile.STATE_DISCONNECTED
                 ) {
-                    fail("VOLTRA disconnected ($status). Reconnect to continue.")
+                    fail("${profile.label} disconnected ($status). Reconnect to continue.")
                     return
                 }
                 if (newState == BluetoothProfile.STATE_CONNECTED)
@@ -160,34 +165,37 @@ private class AndroidVoltraLink(
             }
 
             override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-                if (closed.get()) return
+                if (closed.get() || !setup.beginDiscovery()) return
                 operation {
                     check(status == BluetoothGatt.GATT_SUCCESS && mtu >= profile.minimumMtu) {
-                        "VOLTRA requires a larger Bluetooth packet size."
+                        "${profile.label} requires a larger Bluetooth packet size."
                     }
-                    check(gatt.discoverServices()) { "Unable to discover VOLTRA services." }
+                    check(gatt.discoverServices()) {
+                        "Unable to discover ${profile.label} services."
+                    }
                 }
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-                if (closed.get()) return
+                if (closed.get() || !setup.beginSubscription()) return
                 operation {
                     check(status == BluetoothGatt.GATT_SUCCESS) {
-                        "VOLTRA service discovery failed."
+                        "${profile.label} service discovery failed."
                     }
                     val service =
-                        gatt.getService(profile.service) ?: error("VOLTRA service is unavailable.")
+                        gatt.getService(profile.service)
+                            ?: error("${profile.label} service is unavailable.")
                     writer =
                         service.getCharacteristic(profile.write)
-                            ?: error("VOLTRA controls are unavailable.")
+                            ?: error("${profile.label} controls are unavailable.")
                     val updates =
                         service.getCharacteristic(profile.notify)
-                            ?: error("VOLTRA notifications are unavailable.")
+                            ?: error("${profile.label} notifications are unavailable.")
                     check(updates.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0)
                     check(gatt.setCharacteristicNotification(updates, true))
                     descriptor =
                         updates.getDescriptor(VoltraGatt.cccd)
-                            ?: error("VOLTRA subscription is unavailable.")
+                            ?: error("${profile.label} subscription is unavailable.")
                     subscribe(gatt, requireNotNull(descriptor))
                 }
             }
@@ -198,8 +206,9 @@ private class AndroidVoltraLink(
                 status: Int,
             ) {
                 if (closed.get() || written !== descriptor) return
-                if (status == BluetoothGatt.GATT_SUCCESS) ready.complete(Unit)
-                else fail("VOLTRA subscription failed.")
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    if (setup.complete()) ready.complete(Unit)
+                } else fail("${profile.label} subscription failed.")
             }
 
             override fun onCharacteristicWrite(
@@ -209,7 +218,7 @@ private class AndroidVoltraLink(
             ) {
                 if (closed.get() || characteristic.uuid != profile.write) return
                 if (status == BluetoothGatt.GATT_SUCCESS) writeResult?.complete(Unit)
-                else fail("VOLTRA Bluetooth write failed ($status).")
+                else fail("${profile.label} Bluetooth write failed ($status).")
             }
 
             override fun onCharacteristicChanged(
@@ -234,7 +243,7 @@ private class AndroidVoltraLink(
                         characteristic.service?.uuid == profile.service
                 ) {
                     if (!incoming.trySend(value.copyOf()).isSuccess)
-                        fail("VOLTRA data buffer overflow. Reconnect to continue.")
+                        fail("${profile.label} data buffer overflow. Reconnect to continue.")
                 }
             }
         }
@@ -246,7 +255,7 @@ private class AndroidVoltraLink(
             BluetoothDevice.TRANSPORT_LE,
             BluetoothDevice.PHY_LE_1M_MASK,
             Handler(Looper.getMainLooper()),
-        ) ?: error("Could not connect to VOLTRA.")
+        ) ?: error("Could not connect to ${profile.label}.")
 
     @Suppress("DEPRECATION")
     private fun subscribe(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor) {
@@ -258,13 +267,13 @@ private class AndroidVoltraLink(
                 descriptor.value = value
                 gatt.writeDescriptor(descriptor)
             }
-        check(accepted) { "Unable to subscribe to VOLTRA." }
+        check(accepted) { "Unable to subscribe to ${profile.label}." }
     }
 
     override suspend fun write(frame: ByteArray) =
         withContext(Dispatchers.Main.immediate) {
             writeMutex.withLock {
-                check(!closed.get()) { "VOLTRA disconnected." }
+                check(!closed.get()) { "${profile.label} disconnected." }
                 VoltraBluetooth.problem(context, scanning = false)?.let {
                     fail(it)
                     error(it)
@@ -284,10 +293,10 @@ private class AndroidVoltraLink(
                 writeResult = completion
                 try {
                     val accepted = writeNative(characteristic, frame.copyOf(), type)
-                    check(accepted) { "VOLTRA could not accept the Bluetooth write." }
+                    check(accepted) { "${profile.label} could not accept the Bluetooth write." }
                     if (response) withTimeout(3_000) { completion.await() } else delay(40)
                 } catch (failure: Exception) {
-                    fail("VOLTRA write was interrupted. Reconnect before retrying.")
+                    fail("${profile.label} write was interrupted. Reconnect before retrying.")
                     throw failure
                 } finally {
                     writeResult = null
@@ -315,7 +324,7 @@ private class AndroidVoltraLink(
         } catch (_: SecurityException) {
             fail("Bluetooth permission was revoked.")
         } catch (failure: Exception) {
-            fail(failure.message ?: "VOLTRA Bluetooth operation failed.")
+            fail(failure.message ?: "${profile.label} Bluetooth operation failed.")
         }
     }
 
@@ -329,6 +338,7 @@ private class AndroidVoltraLink(
 
     override fun close() {
         if (closed.getAndSet(true)) return
+        setup.close()
         ready.cancel()
         writeResult?.cancel()
         incoming.close()

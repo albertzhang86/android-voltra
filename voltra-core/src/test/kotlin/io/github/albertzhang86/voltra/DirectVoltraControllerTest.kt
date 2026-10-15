@@ -11,6 +11,186 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class DirectVoltraControllerTest {
     @Test
+    fun `explicitly unloaded resistance is zero while residual tension remains separate`() = runTest {
+        val rig = Rig(this)
+        rig.link().values[VoltraProtocol.RUNTIME_WIRE_WEIGHT] = 1
+        rig.ready()
+        rig.link().send(terseForce(11, targetTenths = 300))
+        runCurrent()
+        assertEquals(0.0, rig.trainer().activeWeightLb!!, 0.001)
+        assertEquals(ActiveWeightSource.UNLOADED, rig.trainer().activeWeightSource)
+        assertEquals(1.1, rig.trainer().measuredForceLb!!, 0.001)
+        assertEquals(1.0, rig.trainer().runtimeWireWeightLb!!, 0.001)
+        assertNull(rig.trainer().resistanceTargetLb)
+        assertEquals(30, rig.trainer().setWeightLb)
+        assertTrue(rig.link().writes.any {
+            it.command == 0x0f && it.register == VoltraProtocol.RUNTIME_WIRE_WEIGHT
+        })
+        rig.link().values.remove(VoltraProtocol.RUNTIME_WIRE_WEIGHT)
+        advanceTimeBy(1800)
+        runCurrent()
+        assertNull(rig.trainer().measuredForceLb)
+        assertNull(rig.trainer().runtimeWireWeightLb)
+        assertEquals(0.0, rig.trainer().activeWeightLb!!, 0.001)
+        rig.controller.close()
+    }
+
+    @Test
+    fun `loaded resistance uses captured target and expires despite fresh measured wire weight`() = runTest {
+        val rig = Rig(this)
+        rig.link().values[VoltraProtocol.FITNESS] = 5
+        rig.link().values[VoltraProtocol.RUNTIME_WIRE_WEIGHT] = 1
+        rig.ready()
+        assertNull(rig.trainer().activeWeightLb)
+        // Physical B4 capture: measured tension 1.1 lb; target resistance 6 lb.
+        rig.link().send(VoltraProtocol.hex("551904e410aacb6e0200b40b0003000000030000003c0045a8"))
+        runCurrent()
+        assertEquals(6.0, rig.trainer().activeWeightLb!!, 0.001)
+        assertEquals(6.0, rig.trainer().resistanceTargetLb!!, 0.001)
+        assertEquals(1.1, rig.trainer().measuredForceLb!!, 0.001)
+        assertEquals(ActiveWeightSource.TARGET_FORCE, rig.trainer().activeWeightSource)
+        advanceTimeBy(1800)
+        runCurrent()
+        assertTrue(rig.trainer().fresh)
+        assertEquals(1.0, rig.trainer().runtimeWireWeightLb!!, 0.001)
+        assertNull(rig.trainer().resistanceTargetLb)
+        assertNull(rig.trainer().activeWeightLb)
+        assertNull(rig.trainer().activeWeightSource)
+        rig.controller.close()
+    }
+
+    @Test
+    fun `missing or invalid target clears resistance and never falls back to force or base weight`() = runTest {
+        val rig = Rig(this)
+        rig.link().values[VoltraProtocol.FITNESS] = 5
+        rig.link().values[VoltraProtocol.RUNTIME_WIRE_WEIGHT] = 20
+        rig.ready()
+        for (packet in listOf(terseForce(427, payloadSize = 6), terseForce(427, targetTenths = 0xffff))) {
+            rig.link().send(terseForce(427, targetTenths = 200))
+            runCurrent()
+            assertEquals(20.0, rig.trainer().activeWeightLb!!, 0.001)
+            rig.link().send(packet)
+            runCurrent()
+            assertNull(rig.trainer().activeWeightLb)
+            assertNull(rig.trainer().resistanceTargetLb)
+            assertEquals(42.7, rig.trainer().measuredForceLb!!, 0.001)
+            assertEquals(30, rig.trainer().setWeightLb)
+        }
+        rig.link().send(terseForce(0xffff, targetTenths = 200))
+        runCurrent()
+        assertNull(rig.trainer().measuredForceLb)
+        assertEquals(20.0, rig.trainer().activeWeightLb!!, 0.001)
+        rig.link().send(report(VoltraProtocol.RUNTIME_WIRE_WEIGHT, -1, 2))
+        runCurrent()
+        assertNull(rig.trainer().runtimeWireWeightLb)
+        rig.controller.close()
+    }
+
+    @Test
+    fun `load transitions discard target and residual readings from the previous load state`() = runTest {
+        val rig = Rig(this)
+        rig.link().values[VoltraProtocol.FITNESS] = 5
+        rig.ready()
+        rig.link().send(terseForce(427, targetTenths = 300))
+        runCurrent()
+        rig.link().send(report(VoltraProtocol.FITNESS, 4, 2))
+        runCurrent()
+        assertEquals(0.0, rig.trainer().activeWeightLb!!, 0.001)
+        assertEquals(ActiveWeightSource.UNLOADED, rig.trainer().activeWeightSource)
+        assertNull(rig.trainer().measuredForceLb)
+        assertNull(rig.trainer().resistanceTargetLb)
+        rig.link().send(terseForce(11, targetTenths = 300))
+        rig.link().send(report(VoltraProtocol.FITNESS, 5, 2))
+        runCurrent()
+        assertNull(rig.trainer().activeWeightLb)
+        assertNull(rig.trainer().measuredForceLb)
+        rig.link().send(terseForce(200, targetTenths = 300))
+        runCurrent()
+        assertEquals(30.0, rig.trainer().activeWeightLb!!, 0.001)
+        for (unknown in listOf(0, 6, 65535)) {
+            rig.link().send(report(VoltraProtocol.FITNESS, unknown, 2))
+            rig.link().send(terseForce(11, targetTenths = 300))
+            runCurrent()
+            assertNull(rig.trainer().activeWeightLb)
+            assertNull(rig.trainer().activeWeightSource)
+        }
+        rig.controller.close()
+    }
+
+    @Test
+    fun `mode and endpoint changes invalidate every live source immediately`() = runTest {
+        val rig = Rig(this)
+        rig.link().values[VoltraProtocol.FITNESS] = 5
+        rig.ready()
+        fun sendReadings() {
+            rig.link().send(report(VoltraProtocol.RUNTIME_WIRE_WEIGHT, 20, 2))
+            rig.link().send(terseForce(427, targetTenths = 300))
+        }
+        sendReadings()
+        runCurrent()
+        rig.link().send(report(VoltraProtocol.MODE, 2, 2))
+        runCurrent()
+        assertNull(rig.trainer().activeWeightLb)
+        assertNull(rig.trainer().measuredForceLb)
+        assertNull(rig.trainer().runtimeWireWeightLb)
+        sendReadings()
+        rig.link().send(endpointReport(LEFT_ADDRESS, RIGHT_ADDRESS))
+        sendReadings()
+        rig.link().send(endpointReport(LEFT_ADDRESS))
+        runCurrent()
+        assertNull(rig.trainer().activeWeightLb)
+        assertNull(rig.trainer().resistanceTargetLb)
+        sendReadings()
+        runCurrent()
+        assertEquals(30.0, rig.trainer().activeWeightLb!!, 0.001)
+        rig.link().send(report(VoltraProtocol.MODE, 8, 1))
+        sendReadings()
+        runCurrent()
+        assertNull(rig.trainer().mode)
+        assertNull(rig.trainer().activeWeightLb)
+        assertNull(rig.trainer().measuredForceLb)
+        rig.controller.close()
+    }
+
+    @Test
+    fun `healthy status cannot keep resistance visible when endpoint identity expires`() = runTest {
+        val rig = Rig(this)
+        rig.link().values[VoltraProtocol.FITNESS] = 5
+        rig.ready()
+        rig.link().respondEndpoint = false
+        advanceTimeBy(4000)
+        runCurrent()
+        rig.link().send(terseForce(427, targetTenths = 300))
+        runCurrent()
+        assertTrue(rig.trainer().fresh)
+        assertFalse(rig.trainer().twinStatusKnown)
+        assertNull(rig.trainer().activeWeightLb)
+        rig.link().send(endpointReport(LEFT_ADDRESS))
+        runCurrent()
+        assertNull(rig.trainer().activeWeightLb)
+        rig.link().send(terseForce(285, targetTenths = 300))
+        runCurrent()
+        assertEquals(30.0, rig.trainer().activeWeightLb!!, 0.001)
+        rig.controller.close()
+    }
+
+    @Test
+    fun `direct trainers retain their own display units across readbacks`() = runTest {
+        val rig = Rig(this)
+        rig.link().values[VoltraProtocol.WEIGHT_UNIT] = 1
+        rig.link("right").values[VoltraProtocol.WEIGHT_UNIT] = 0
+        rig.ready(2)
+        assertEquals(WeightUnit.KILOGRAMS, rig.trainer().weightUnit)
+        assertEquals(WeightUnit.POUNDS, rig.trainer("right").weightUnit)
+        rig.link().send(report(VoltraProtocol.WEIGHT_UNIT, 7, 4))
+        runCurrent()
+        assertNull(rig.trainer().weightUnit)
+        assertEquals(WeightUnit.POUNDS, rig.trainer("right").weightUnit)
+        assertEquals(30, rig.trainer().setWeightLb)
+        rig.controller.close()
+    }
+
+    @Test
     fun `connecting reads trainer settings without changing load or mode`() = runTest {
         val rig = Rig(this)
         rig.ready()
@@ -78,10 +258,11 @@ class DirectVoltraControllerTest {
         rig.ready()
         rig.link().send(force(285))
         runCurrent()
-        assertEquals(28.5, rig.trainer().activeWeightLb!!, 0.001)
+        assertEquals(28.5, rig.trainer().measuredForceLb!!, 0.001)
         advanceTimeBy(1_800)
         runCurrent()
-        assertNull(rig.trainer().activeWeightLb)
+        assertNull(rig.trainer().measuredForceLb)
+        assertEquals(0.0, rig.trainer().activeWeightLb!!, 0.001)
         assertTrue(rig.trainer().fresh)
         rig.controller.close()
     }
@@ -178,24 +359,121 @@ class DirectVoltraControllerTest {
     }
 
     @Test
-    fun `Twin is not faked with independent writes and detected native Twin is read only`() =
+    fun `native pair sends controller identity to peer and confirms topology before ready`() =
         runTest {
             val rig = Rig(this)
             rig.ready(2)
-            assertFalse(rig.controller.state.value.twinSupported)
-            assertTrue(runCatching { rig.controller.createTwin("left", "right") }.isFailure)
-            assertTrue(runCatching { rig.controller.exitTwin() }.isFailure)
-            rig.link().send(report(VoltraProtocol.TWIN_STATUS, 2, 1))
+            val pair = async { rig.controller.createTwin("left", "right") }
+            advanceTimeBy(1500)
+            runCurrent()
+            pair.await()
+            val state = rig.controller.state.value
+            assertEquals("left", state.twin?.controllerId)
+            assertEquals("right", state.twin?.peerId)
+            assertEquals(TwinHealth.READY, state.twin?.health)
+            assertTrue(rig.link("right").writes.any { it.command == VoltraProtocol.TWIN_COMMAND })
+            assertTrue(rig.link("left").writes.none { it.command == VoltraProtocol.TWIN_COMMAND })
+            assertEquals(TwinRole.PEER, rig.trainer("right").twinRole)
+            assertFalse(rig.trainer("right").canChangeMode)
+            assertTrue(state.canExitTwin)
+            // A native single-device force packet must never be doubled into pair telemetry.
             rig.link().send(force(300))
             runCurrent()
-            assertTrue(rig.trainer().twinReported)
+            assertNull(rig.controller.state.value.twin?.activeWeightLb)
             assertNull(rig.trainer().activeWeightLb)
-            assertFalse(rig.trainer().canChangeMode)
-            assertTrue(
-                runCatching { rig.controller.setParameter("left", Parameter.WEIGHT, 45) }.isFailure
-            )
             rig.controller.close()
         }
+
+    @Test
+    fun `already paired controller discovers peer without a second BLE connection`() = runTest {
+        val rig = Rig(this)
+        rig.link().peerAddress = RIGHT_ADDRESS
+        rig.ready()
+        val state = rig.controller.state.value
+        assertEquals(2, state.trainers.size)
+        assertEquals(RIGHT_ADDRESS, state.twin?.peerId)
+        assertEquals(TwinHealth.READY, state.twin?.health)
+        assertEquals(70, state.trainers.last().batteryPercent)
+        assertTrue(rig.link("right").writes.isEmpty())
+        rig.controller.close()
+    }
+
+    @Test
+    fun `Twin exit confirms independent status then reconnects peer`() = runTest {
+        val rig = Rig(this)
+        rig.ready(2)
+        val pair = async { rig.controller.createTwin("left", "right") }
+        advanceTimeBy(1500)
+        runCurrent()
+        pair.await()
+        val exit = async { rig.controller.exitTwin() }
+        advanceTimeBy(5500)
+        runCurrent()
+        exit.await()
+        assertNull(rig.controller.state.value.twin)
+        assertTrue(
+            rig.controller.state.value.trainers.all { it.connected && it.fresh && !it.twinReported }
+        )
+        assertEquals(2, rig.controller.state.value.trainers.size)
+        rig.controller.close()
+    }
+
+    @Test
+    fun `exit waits for peer advertisement and never replays unpair when peer stays offline`() =
+        runTest {
+            val rig = Rig(this)
+            rig.ready(2)
+            val pair = async { rig.controller.createTwin("left", "right") }
+            advanceTimeBy(1500)
+            runCurrent()
+            pair.await()
+            rig.advertised.value = emptyList()
+            val before = rig.connectionAttempts.size
+            val exit = async { runCatching { rig.controller.exitTwin() } }
+            advanceTimeBy(4000)
+            runCurrent()
+            assertNull(rig.controller.state.value.twin)
+            assertEquals(before, rig.connectionAttempts.size)
+            assertFalse(exit.isCompleted)
+            advanceTimeBy(14000)
+            runCurrent()
+            assertTrue(exit.await().isFailure)
+            assertEquals(1, rig.link().writes.count { it.command == VoltraProtocol.TWIN_COMMAND })
+            assertNull(rig.controller.state.value.twin)
+            assertTrue(rig.trainer().connected)
+            rig.controller.close()
+        }
+
+    @Test
+    fun `lost Twin endpoint status preserves degraded pair and blocks controls`() = runTest {
+        val rig = Rig(this)
+        rig.link().peerAddress = RIGHT_ADDRESS
+        rig.ready()
+        rig.link().respondEndpoint = false
+        advanceTimeBy(4000)
+        runCurrent()
+        assertEquals(TwinHealth.DEGRADED, rig.controller.state.value.twin?.health)
+        assertFalse(rig.controller.state.value.canExitTwin)
+        assertFalse(rig.trainer().canChangeMode)
+        assertTrue(
+            runCatching { rig.controller.setParameter("left", Parameter.WEIGHT, 45) }.isFailure
+        )
+        rig.controller.close()
+    }
+
+    @Test
+    fun `Twin acknowledgment alone never creates a pair`() = runTest {
+        val rig = Rig(this)
+        rig.ready(2)
+        rig.link("right").applyTwin = false
+        val pairing = async { runCatching { rig.controller.createTwin("left", "right") } }
+        advanceTimeBy(16000)
+        runCurrent()
+        assertTrue(pairing.await().isFailure)
+        assertNull(rig.controller.state.value.twin)
+        assertFalse(rig.controller.state.value.twinPending)
+        rig.controller.close()
+    }
 
     @Test
     fun `disconnect cancels pending command and does not replay it on reconnect`() = runTest {
@@ -214,19 +492,131 @@ class DirectVoltraControllerTest {
         assertEquals(30, rig.trainer().setWeightLb)
         rig.controller.close()
     }
+
+    @Test
+    fun `forget cancels pending settings and removes only the independent target`() = runTest {
+        val rig = Rig(this)
+        rig.ready(2)
+        rig.link().acceptSettings = false
+        val update = async {
+            runCatching { rig.controller.setParameter("left", Parameter.WEIGHT, 45) }
+        }
+        runCurrent()
+        val writes = rig.link().writes.size
+        rig.controller.forget("left")
+        runCurrent()
+        assertTrue(update.isCompleted)
+        assertTrue(update.await().isFailure)
+        assertTrue(rig.link().closed)
+        assertEquals(listOf("right"), rig.controller.state.value.trainers.map { it.device.id })
+        advanceTimeBy(500)
+        assertEquals(writes, rig.link().writes.size)
+        rig.controller.close()
+    }
+
+    @Test
+    fun `forget native Twin peer closes local pair without changing hardware topology`() = runTest {
+        val rig = Rig(this)
+        rig.link().peerAddress = RIGHT_ADDRESS
+        rig.ready()
+        val writes = rig.link().writes.size
+        rig.controller.forget(RIGHT_ADDRESS)
+        runCurrent()
+        assertTrue(rig.controller.state.value.trainers.isEmpty())
+        assertNull(rig.controller.state.value.twin)
+        assertTrue(rig.link().closed)
+        assertEquals(RIGHT_ADDRESS, rig.link().peerAddress)
+        assertEquals(writes, rig.link().writes.size)
+        assertTrue(rig.link().writes.none { it.command == VoltraProtocol.TWIN_COMMAND })
+        rig.controller.close()
+    }
+
+    @Test
+    fun `forget during Twin exit discovery prevents delayed peer reconnect`() = runTest {
+        val rig = Rig(this)
+        rig.ready(2)
+        val pair = async { rig.controller.createTwin("left", "right") }
+        advanceTimeBy(1500)
+        runCurrent()
+        pair.await()
+        rig.advertised.value = emptyList()
+        val exit = async { runCatching { rig.controller.exitTwin() } }
+        advanceTimeBy(4000)
+        runCurrent()
+        assertNull(rig.controller.state.value.twin)
+        assertFalse(exit.isCompleted)
+        val attempts = rig.connectionAttempts.size
+        val writes = rig.link().writes.size
+        rig.controller.forget("right")
+        rig.advertised.value = listOf(VoltraDevice("right", "Right"))
+        runCurrent()
+        assertTrue(exit.await().isFailure)
+        assertTrue(rig.controller.state.value.trainers.isEmpty())
+        assertFalse(rig.controller.state.value.twinPending)
+        assertEquals(attempts, rig.connectionAttempts.size)
+        assertEquals(writes, rig.link().writes.size)
+        rig.controller.close()
+    }
+
+    @Test
+    fun `forget invalidates a Twin request queued behind an unconfirmed pair`() = runTest {
+        val rig = Rig(this)
+        rig.ready(2)
+        rig.link("right").applyTwin = false
+        val pairing = async { runCatching { rig.controller.createTwin("left", "right") } }
+        runCurrent()
+        val queued = async { runCatching { rig.controller.createTwin("left", "right") } }
+        runCurrent()
+        assertFalse(pairing.isCompleted)
+        assertFalse(queued.isCompleted)
+        val peerLink = rig.link("right")
+        rig.controller.forget("right")
+        runCurrent()
+        assertTrue(pairing.await().isFailure)
+        val queuedFailure = queued.await().exceptionOrNull()
+        assertNotNull(queuedFailure)
+        assertEquals("Device connections changed.", queuedFailure!!.message)
+        assertEquals(1, peerLink.writes.count { it.command == VoltraProtocol.TWIN_COMMAND })
+        assertTrue(rig.controller.state.value.trainers.isEmpty())
+        rig.ready(2)
+        assertTrue(rig.link("right").writes.none { it.command == VoltraProtocol.TWIN_COMMAND })
+        assertNull(rig.controller.state.value.twin)
+        rig.controller.close()
+    }
 }
 
 @OptIn(ExperimentalCoroutinesApi::class)
 private class Rig(val scope: TestScope) {
-    private val links = mutableMapOf("left" to FakeLink(), "right" to FakeLink())
+    private val links = mutableMapOf<String, FakeLink>()
+    val advertised =
+        MutableStateFlow(listOf(VoltraDevice("left", "Left"), VoltraDevice("right", "Right")))
+    val connectionAttempts = mutableListOf<String>()
+
+    init {
+        links["left"] = newLink(LEFT_ADDRESS)
+        links["right"] = newLink(RIGHT_ADDRESS)
+    }
+
+    private fun newLink(address: String): FakeLink =
+        FakeLink(address).also { link ->
+            link.onTwin = { operation, remote ->
+                if (operation == 1) {
+                    links.values.single { it.address == remote }.peerAddress = link.address
+                } else {
+                    link.peerAddress = ZERO_ADDRESS
+                }
+            }
+        }
+
     private val transport =
         object : VoltraTransport {
-            override fun scan() =
-                flowOf(listOf(VoltraDevice("left", "Left"), VoltraDevice("right", "Right")))
+            override fun scan() = advertised
 
             override suspend fun connect(device: VoltraDevice) =
                 links.getValue(device.id).let {
-                    if (it.closed) FakeLink().also { next -> links[device.id] = next } else it
+                    connectionAttempts += device.id
+                    if (it.closed) newLink(it.address).also { next -> links[device.id] = next }
+                    else it
                 }
         }
     val controller =
@@ -250,7 +640,15 @@ private class Rig(val scope: TestScope) {
 
 private data class Write(val command: Int, val register: Int)
 
-private class FakeLink : VoltraLink {
+private const val LEFT_ADDRESS = "02:00:00:00:00:01"
+private const val RIGHT_ADDRESS = "02:00:00:00:00:02"
+private const val ZERO_ADDRESS = "00:00:00:00:00:00"
+
+private class FakeLink(val address: String) : VoltraLink {
+    var peerAddress = ZERO_ADDRESS
+    var respondEndpoint = true
+    var applyTwin = true
+    var onTwin: (Int, String) -> Unit = { _, _ -> }
     private val channel = Channel<ByteArray>(Channel.UNLIMITED)
     override val packets = channel.receiveAsFlow()
     val values =
@@ -279,11 +677,39 @@ private class FakeLink : VoltraLink {
             values[register] =
                 if (register == Parameter.ECCENTRIC.register) raw.toShort().toInt() else raw
         }
+        if (command == VoltraProtocol.ENDPOINT_STATUS && respond && respondEndpoint)
+            send(endpointReport(address, peerAddress))
+        if (command == VoltraProtocol.TWIN_COMMAND && respond) {
+            val operation = frame[11].toInt()
+            val remote =
+                (12..17).joinToString(":") {
+                    (frame[it].toInt() and 255).toString(16).padStart(2, '0').uppercase()
+                }
+            if (applyTwin) onTwin(operation, remote)
+            send(
+                VoltraProtocol.seal(
+                    ByteArray(16).also {
+                        it[0] = 0x55
+                        it[2] = 8
+                        it[6] = frame[6]
+                        it[7] = frame[7]
+                        it[10] = VoltraProtocol.TWIN_COMMAND.toByte()
+                        it[12] = operation.toByte()
+                    }
+                )
+            )
+            if (operation == 1 && applyTwin) close()
+        }
         if (command == 0x0f && respond)
             values[register]?.let { value ->
                 val width =
                     Parameter.entries.find { it.register == register }?.width
-                        ?: if (register == VoltraProtocol.FITNESS) 2 else 1
+                        ?: if (
+                            register in
+                                listOf(VoltraProtocol.FITNESS, VoltraProtocol.RUNTIME_WIRE_WEIGHT)
+                        )
+                            2
+                        else 1
                 send(report(register, value, width))
             }
     }
@@ -296,4 +722,28 @@ private class FakeLink : VoltraLink {
         closed = true
         channel.close()
     }
+}
+
+internal fun endpointReport(
+    local: String,
+    peer: String = "00:00:00:00:00:00",
+    response: Boolean = false,
+): ByteArray {
+    val payload = if (response) 12 else 11
+    return VoltraProtocol.seal(
+        ByteArray(if (response) 36 else 35).also { frame ->
+            frame[0] = 0x55
+            frame[2] = if (response) 8 else 4
+            frame[10] = VoltraProtocol.ENDPOINT_STATUS.toByte()
+            frame[payload] = 80
+            frame[payload + 2] = if (peer == "00:00:00:00:00:00") 0 else 0x12
+            local.split(':').forEachIndexed { index, part ->
+                frame[payload + 3 + index] = part.toInt(16).toByte()
+            }
+            peer.split(':').forEachIndexed { index, part ->
+                frame[payload + 9 + index] = part.toInt(16).toByte()
+            }
+            frame[payload + 15] = 70
+        }
+    )
 }

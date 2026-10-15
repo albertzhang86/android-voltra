@@ -2,6 +2,21 @@ package io.github.albertzhang86.voltra
 
 data class VoltraDevice(val id: String, val name: String)
 
+/** Display preference only. Weight settings and live force remain in protocol pounds. */
+enum class WeightUnit(val symbol: String) {
+    POUNDS("lb"),
+    KILOGRAMS("kg");
+
+    companion object {
+        fun fromWire(value: Int): WeightUnit? =
+            when (value) {
+                0 -> POUNDS
+                1 -> KILOGRAMS
+                else -> null
+            }
+    }
+}
+
 enum class TrainingMode(val wireValue: Int, val label: String) {
     WEIGHT(1, "Weight training"),
     BAND(2, "Resistance band"),
@@ -61,12 +76,31 @@ enum class ConnectionStatus {
     FAILED,
 }
 
+enum class TwinRole {
+    CONTROLLER,
+    PEER,
+}
+
+enum class TwinHealth {
+    READY,
+    DEGRADED,
+}
+
+/** Source of active resistance. Legacy measurement values remain for source compatibility. */
+enum class ActiveWeightSource {
+    CABLE_FORCE,
+    RUNTIME_WIRE_WEIGHT,
+    TARGET_FORCE,
+    UNLOADED,
+}
+
 data class TrainerState(
     val device: VoltraDevice,
     val status: ConnectionStatus = ConnectionStatus.CONNECTING,
     val mode: TrainingMode? = null,
     val parameters: Map<Parameter, Int> = emptyMap(),
     val batteryPercent: Int? = null,
+    /** Fresh device-reported resistance target, or zero for an explicitly unloaded trainer. */
     val activeWeightLb: Double? = null,
     val reps: Int? = null,
     val fitnessMode: Int? = null,
@@ -79,12 +113,27 @@ data class TrainerState(
     /** Optional bridge capabilities narrow the normal device-state gates. */
     val editableParameters: Set<Parameter>? = null,
     val modeChangeAllowed: Boolean = true,
+    /** Set only after the connector verifies both identities and the live topology. */
+    val twinRole: TwinRole? = null,
+    val twinVerified: Boolean = false,
+    /** Unit displayed by the trainer, or by the knob when connected through its bridge. */
+    val weightUnit: WeightUnit? = null,
+    val activeWeightSource: ActiveWeightSource? = null,
+    /** Measured cable tension; can remain nonzero while the trainer is unloaded. */
+    val measuredForceLb: Double? = null,
+    /** Coarse measured wire-weight register, independent of the resistance target. */
+    val runtimeWireWeightLb: Double? = null,
+    /** Fresh B4 target while explicitly loaded; never inferred from the base setting. */
+    val resistanceTargetLb: Double? = null,
 ) {
     val connected
         get() = status == ConnectionStatus.READY
 
     val unloaded
         get() = fitnessMode == 4 || fitnessMode == 0
+
+    val loaded
+        get() = fitnessMode == 5 || fitnessMode == 21
 
     val setWeightLb: Int?
         get() =
@@ -101,7 +150,7 @@ data class TrainerState(
             fresh &&
             !pending &&
             twinStatusKnown &&
-            !twinReported &&
+            (!twinReported || (twinVerified && twinRole == TwinRole.CONTROLLER)) &&
             parameter in parameters &&
             (editableParameters == null || parameter in editableParameters) &&
             parameter in Parameter.forMode(mode) &&
@@ -109,18 +158,30 @@ data class TrainerState(
 
     val canChangeMode
         get() =
-            mode != null &&
+            (mode != null || fitnessMode == 0) &&
                 modeChangeAllowed &&
                 connected &&
                 fresh &&
                 unloaded &&
                 !pending &&
                 twinStatusKnown &&
-                !twinReported
+                (!twinReported || (twinVerified && twinRole == TwinRole.CONTROLLER))
 }
 
 /** A confirmed pair has an explicit controller; two independent devices never imply Twin mode. */
-data class TwinPair(val controllerId: String, val peerId: String)
+data class TwinPair(
+    val controllerId: String,
+    val peerId: String,
+    val health: TwinHealth = TwinHealth.READY,
+    /** Logical pair telemetry. Never add or double unclassified native force readings. */
+    val activeWeightLb: Double? = null,
+    val reps: Int? = null,
+    val setWeightLb: Int? = null,
+) {
+    init {
+        require(controllerId != peerId)
+    }
+}
 
 data class VoltraState(
     val trainers: List<TrainerState> = emptyList(),
@@ -130,11 +191,53 @@ data class VoltraState(
     val isSimulated: Boolean = false,
     val knob: KnobState? = null,
     val viaKnob: Boolean = false,
-)
+) {
+    val canCreateTwin: Boolean
+        get() =
+            twinSupported &&
+                twin == null &&
+                !twinPending &&
+                ((trainers.size == 2 && trainers.map { it.device.id }.distinct().size == 2) ||
+                    (viaKnob && trainers.size == 1 && knob?.twinCandidate != null)) &&
+                trainers.all {
+                    it.connected &&
+                        it.fresh &&
+                        it.unloaded &&
+                        !it.pending &&
+                        it.twinStatusKnown &&
+                        !it.twinReported
+                }
+
+    val canExitTwin: Boolean
+        get() =
+            twinSupported &&
+                twin?.health == TwinHealth.READY &&
+                (!viaKnob || isSimulated || knob?.twinExitAllowed == true) &&
+                !twinPending &&
+                trainers.size == 2 &&
+                trainers.map { it.device.id }.toSet() == setOf(twin.controllerId, twin.peerId) &&
+                trainers.all {
+                    it.connected &&
+                        it.fresh &&
+                        it.unloaded &&
+                        !it.pending &&
+                        it.twinStatusKnown &&
+                        it.twinReported &&
+                        it.twinVerified &&
+                        it.twinRole ==
+                            if (it.device.id == twin.controllerId) TwinRole.CONTROLLER
+                            else TwinRole.PEER
+                }
+}
 
 data class KnobState(
     val device: VoltraDevice,
     val status: ConnectionStatus,
     val batteryPercent: Int? = null,
     val error: String? = null,
+    /** Candidate for pairing, not a connected trainer. */
+    val twinCandidate: VoltraDevice? = null,
+    val twinExitAllowed: Boolean = false,
+    /** USB-host power detected; not proof of battery charging or charge completion. */
+    val usbPowerConnected: Boolean = false,
 )

@@ -2,12 +2,17 @@ package io.github.albertzhang86.voltra.protocol
 
 import io.github.albertzhang86.voltra.Parameter
 
-/** MIT protocol references and their pinned revisions are listed in THIRD_PARTY.md. */
+/** Protocol references and their pinned revisions are listed in THIRD_PARTY.md. */
 object VoltraProtocol {
     const val MODE = 0x4fb0
     const val FITNESS = 0x3e89
     const val BATTERY = 0x4e2d
+    const val WEIGHT_UNIT = 0x506e
+    /** Signed 16-bit runtime wire weight in whole pounds, separate from the base-weight setting. */
+    const val RUNTIME_WIRE_WEIGHT = 0x3e83
     const val TWIN_STATUS = 0x516c
+    const val ENDPOINT_STATUS = 0xa7
+    const val TWIN_COMMAND = 0xa8
     val initialFrames: List<ByteArray>
         get() =
             listOf(
@@ -47,6 +52,24 @@ object VoltraProtocol {
     }
 
     fun subscribe() = hex("551504a9aa10012020001101008351ffffffff35eb")
+
+    fun endpointStatus() = envelope(ENDPOINT_STATUS, byteArrayOf())
+
+    /** Pair is sent to the future peer; exit is sent to the connected controller. */
+    internal fun twinCommand(operation: Int, address: String, sequence: Int): ByteArray {
+        require(operation in 1..2)
+        require(address.matches(Regex("[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}")))
+        require(address != EndpointStatus.ZERO_ADDRESS)
+        return envelope(
+                TWIN_COMMAND,
+                byteArrayOf(operation.toByte()) + address.split(':').map { it.toInt(16).toByte() },
+            )
+            .also {
+                it[6] = sequence.toByte()
+                it[7] = (sequence ushr 8).toByte()
+                seal(it)
+            }
+    }
 
     private fun envelope(command: Int, payload: ByteArray): ByteArray =
         seal(
@@ -95,16 +118,54 @@ object VoltraProtocol {
 
 data class ProtocolUpdate(
     val registers: Map<Int, Int> = emptyMap(),
+    /** Legacy name for measured force. Prefer cableForceLb; this is not active resistance. */
     val activeWeightLb: Double? = null,
     val deviceSet: Int? = null,
     val rep: Int? = null,
-)
+    val endpoint: EndpointStatus? = null,
+    internal val twinReply: TwinCommandReply? = null,
+    /** Runtime register readback, not a sample from the high-rate cable-force stream. */
+    val runtimeWeightLb: Double? = null,
+    val resistanceTargetLb: Double? = null,
+    /** True for B4, including packets where the optional target is absent or invalid. */
+    val resistanceTargetReported: Boolean = false,
+) {
+    val cableForceLb: Double? get() = activeWeightLb
+}
 
 object VoltraDecoder {
     fun decode(frame: ByteArray): ProtocolUpdate? {
         if (!VoltraProtocol.valid(frame)) return null
         fun u(offset: Int, width: Int = 1) = VoltraProtocol.unsigned(frame, offset, width)
-        if (frame.size == 58 && u(2) == 4 && u(10) != 0x10) {
+        if (u(10) == VoltraProtocol.ENDPOINT_STATUS)
+            return EndpointStatus.decode(frame)?.let { ProtocolUpdate(endpoint = it) }
+        if (u(10) == VoltraProtocol.TWIN_COMMAND) {
+            if (frame.size != 16 || u(2) and 0xfc != 8 || u(11) != 0) return null
+            return ProtocolUpdate(twinReply = TwinCommandReply(u(6, 2), u(12), u(13)))
+        }
+        if (u(10) == 0xb4) {
+            // Terse runtime: the first word is measured force in tenths of pounds. The
+            // optional trailing word is TARGET resistance, separate from measured tension.
+            // Native Twin sources 0x10/0x11/0x12 have additional, unclassified fields.
+            if (u(2) != 4 || u(9) != 0) return null
+            val payloadSize = frame.size - 13
+            val knownLayout =
+                when (u(8)) {
+                    0 -> payloadSize == 6 || payloadSize == 8
+                    1,
+                    2 -> payloadSize == 10 || payloadSize == 12
+                    else -> false
+                }
+            if (!knownLayout) return null
+            val required = if (u(8) == 0) 6 else 10
+            val target = if (payloadSize == required + 2) u(11 + required, 2) else null
+            return ProtocolUpdate(
+                activeWeightLb = u(11, 2) / 10.0,
+                resistanceTargetLb = target?.takeIf { it in 0..10000 }?.div(10.0),
+                resistanceTargetReported = true,
+            )
+        }
+        if (frame.size == 58 && u(2) == 4 && u(10) == 0xaa && u(11) == 0x81 && u(12) == 0x2b) {
             return ProtocolUpdate(activeWeightLb = u(22, 2) / 10.0)
         }
         if (u(10) == 0xaa) {
@@ -133,7 +194,9 @@ object VoltraDecoder {
             val expected =
                 parameter?.width
                     ?: when (id) {
-                        VoltraProtocol.FITNESS -> 2
+                        VoltraProtocol.FITNESS,
+                        VoltraProtocol.RUNTIME_WIRE_WEIGHT -> 2
+                        VoltraProtocol.WEIGHT_UNIT -> 4
                         VoltraProtocol.MODE,
                         VoltraProtocol.BATTERY,
                         VoltraProtocol.TWIN_STATUS -> 1
@@ -143,12 +206,19 @@ object VoltraDecoder {
             // registers.
             val width = if (count == 1) frame.size - 2 - offset else expected
             if (width !in listOf(1, 2, 4) || offset + width > frame.size - 2) return null
+            if (id == VoltraProtocol.RUNTIME_WIRE_WEIGHT && width != 2) return null
             val value = VoltraProtocol.unsigned(frame, offset, width)
-            values[id] = if (id == Parameter.ECCENTRIC.register) value.toShort().toInt() else value
+            values[id] =
+                if (id == Parameter.ECCENTRIC.register || id == VoltraProtocol.RUNTIME_WIRE_WEIGHT)
+                    value.toShort().toInt()
+                else value
             offset += width
         }
         if (offset != frame.size - 2) return null
-        return ProtocolUpdate(values)
+        return ProtocolUpdate(
+            values,
+            runtimeWeightLb = values[VoltraProtocol.RUNTIME_WIRE_WEIGHT]?.toDouble(),
+        )
     }
 }
 

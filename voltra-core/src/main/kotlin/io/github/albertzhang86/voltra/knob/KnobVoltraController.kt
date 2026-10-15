@@ -11,12 +11,17 @@ class KnobVoltraController(
     private val transport: VoltraTransport,
     parentScope: CoroutineScope,
     private val now: () -> Long = { System.nanoTime() / 1_000_000 },
+    rememberedDevice: VoltraDevice? = null,
+    private val onConnected: (VoltraDevice) -> Unit = {},
+    private val onForgotten: (String) -> Unit = {},
 ) : VoltraController {
     private val job = SupervisorJob(parentScope.coroutineContext[Job])
     private val scope = CoroutineScope(parentScope.coroutineContext + job)
-    private val mutableState = MutableStateFlow(VoltraState(viaKnob = true))
+    private var rememberedDevice = rememberedDevice
+    private val mutableState = MutableStateFlow(disconnectedState())
     override val state = mutableState.asStateFlow()
     private val commands = Mutex()
+    private val commandJobs = mutableSetOf<Job>()
     private var link: VoltraLink? = null
     private var connection: Job? = null
     private var snapshot: KnobProtocol.Snapshot? = null
@@ -41,10 +46,29 @@ class KnobVoltraController(
                 if (snapshot != null && now() - receivedAt > 2000) {
                     mutableState.update {
                         it.copy(
+                            twin =
+                                it.twin?.copy(
+                                    health = TwinHealth.DEGRADED,
+                                    activeWeightLb = null,
+                                    reps = null,
+                                ),
+                            knob = it.knob?.copy(
+                                twinCandidate = null,
+                                twinExitAllowed = false,
+                                usbPowerConnected = false,
+                            ),
                             trainers =
                                 it.trainers.map { trainer ->
-                                    trainer.copy(fresh = false, activeWeightLb = null, reps = null)
-                                }
+                                    trainer.copy(
+                                        fresh = false,
+                                        activeWeightLb = null,
+                                        activeWeightSource = null,
+                                        measuredForceLb = null,
+                                        runtimeWireWeightLb = null,
+                                        resistanceTargetLb = null,
+                                        reps = null,
+                                    )
+                                },
                         )
                     }
                     pending
@@ -63,7 +87,12 @@ class KnobVoltraController(
 
     override suspend fun connect(device: VoltraDevice) {
         check(job.isActive)
-        check(state.value.knob == null) { "Disconnect the current knob first." }
+        state.value.knob
+            ?.takeIf { it.status == ConnectionStatus.FAILED }
+            ?.let { disconnect(it.device.id) }
+        check(state.value.knob?.status.let { it == null || it == ConnectionStatus.DISCONNECTED }) {
+            "Disconnect the current knob first."
+        }
         val token = ++generation
         mutableState.value =
             VoltraState(knob = KnobState(device, ConnectionStatus.CONNECTING), viaKnob = true)
@@ -71,6 +100,7 @@ class KnobVoltraController(
             scope.launch {
                 var opened: VoltraLink? = null
                 var firstReadingTimeout: Job? = null
+                var pairingTimedOut = false
                 try {
                     val connected = transport.connect(device)
                     opened = connected
@@ -80,13 +110,22 @@ class KnobVoltraController(
                         // GATT subscription can finish before Android's pairing prompt does.
                         // Allow time to enter the code shown on the knob.
                         delay(90_000)
-                        if (generation == token && snapshot == null) connected.close()
+                        if (generation == token && snapshot == null) {
+                            pairingTimedOut = true
+                            connected.close()
+                        }
                     }
                     connected.packets.collect { bytes ->
                         if (generation != token) return@collect
                         when {
-                            KnobProtocol.header(bytes, KnobProtocol.SNAPSHOT) ->
+                            KnobProtocol.header(bytes, KnobProtocol.SNAPSHOT) -> {
+                                val firstReading = snapshot == null
                                 receive(KnobProtocol.snapshot(bytes))
+                                if (firstReading && generation == token) {
+                                    rememberedDevice = device
+                                    onConnected(device)
+                                }
+                            }
                             KnobProtocol.header(bytes, KnobProtocol.RESULT) -> {
                                 val result = KnobProtocol.result(bytes)
                                 val request = pending
@@ -116,28 +155,54 @@ class KnobVoltraController(
                             else -> error("Knob firmware uses an unsupported bridge protocol.")
                         }
                     }
-                    error("Knob disconnected.")
+                    error(
+                        if (pairingTimedOut)
+                            "No readings from the knob. Reconnect with the knob powered on and nearby."
+                        else "Knob disconnected. Reconnect to continue."
+                    )
+                } catch (timeout: TimeoutCancellationException) {
+                    failConnection(
+                        token,
+                        IllegalStateException(
+                            "Knob connection timed out. Check that it is powered on and nearby, then reconnect.",
+                            timeout,
+                        ),
+                    )
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (failure: Exception) {
-                    if (generation != token) return@launch
-                    pending?.completion?.completeExceptionally(failure)
-                    mutableState.update {
-                        it.copy(
-                            trainers = emptyList(),
-                            knob =
-                                it.knob?.copy(
-                                    status = ConnectionStatus.FAILED,
-                                    error = failure.message ?: "Knob connection failed.",
-                                ),
-                        )
-                    }
+                    failConnection(token, failure)
                 } finally {
                     firstReadingTimeout?.cancel()
                     opened?.close()
                     if (link === opened) link = null
                 }
             }
+    }
+
+    private fun failConnection(token: Int, failure: Exception) {
+        if (generation != token) return
+        pending?.completion?.completeExceptionally(failure)
+        snapshot = null
+        snapshots.value = null
+        baseline = null
+        mutableState.update {
+            it.copy(
+                trainers = emptyList(),
+                twin = null,
+                twinPending = false,
+                twinSupported = false,
+                knob =
+                    it.knob?.copy(
+                        status = ConnectionStatus.FAILED,
+                        batteryPercent = null,
+                        usbPowerConnected = false,
+                        twinCandidate = null,
+                        twinExitAllowed = false,
+                        error = failure.message ?: "Knob connection failed.",
+                    ),
+            )
+        }
     }
 
     private fun receive(update: KnobProtocol.Snapshot) {
@@ -170,13 +235,46 @@ class KnobVoltraController(
                     pending = trainer.pending || pending != null,
                 )
             }
+        val peer =
+            update.peer
+                ?.takeIf { trainer?.twinReported == true && update.version == 2 }
+                ?.let { device ->
+                    requireNotNull(trainer)
+                        .copy(
+                            device = device,
+                            batteryPercent = update.peerBattery,
+                            twinRole = TwinRole.PEER,
+                            activeWeightLb = null,
+                            activeWeightSource = null,
+                            measuredForceLb = null,
+                            runtimeWireWeightLb = null,
+                            resistanceTargetLb = null,
+                            reps = null,
+                            editableParameters = emptySet(),
+                            modeChangeAllowed = false,
+                        )
+                }
+        val pair =
+            if (trainer != null && peer != null)
+                TwinPair(
+                    trainer.device.id,
+                    peer.device.id,
+                    if (trainer.connected && trainer.fresh && trainer.twinVerified) TwinHealth.READY
+                    else TwinHealth.DEGRADED,
+                )
+            else null
         mutableState.update {
             it.copy(
-                trainers = listOfNotNull(trainer),
+                twin = pair,
+                twinSupported = update.version == 2,
+                trainers = listOfNotNull(trainer, peer),
                 knob =
                     it.knob?.copy(
                         status = ConnectionStatus.READY,
                         batteryPercent = update.knobBattery,
+                        usbPowerConnected = update.knobUsbPowerConnected,
+                        twinCandidate = update.peer.takeIf { update.canCreateTwin },
+                        twinExitAllowed = update.canExitTwin,
                         error = null,
                     ),
             )
@@ -192,6 +290,7 @@ class KnobVoltraController(
         ++generation
         connection?.cancel()
         connection = null
+        commandJobs.toList().forEach { it.cancel() }
         link?.close()
         link = null
         pending?.completion?.cancel()
@@ -200,7 +299,24 @@ class KnobVoltraController(
         snapshots.value = null
         baseline = null
         nextId = 1
-        mutableState.value = VoltraState(viaKnob = true)
+        mutableState.value = disconnectedState()
+    }
+
+    private fun disconnectedState() =
+        VoltraState(
+            viaKnob = true,
+            knob = rememberedDevice?.let { KnobState(it, ConnectionStatus.DISCONNECTED) },
+        )
+
+    override fun forget(deviceId: String) {
+        require(state.value.trainers.none { it.device.id == deviceId }) {
+            "Manage trainers on the knob. Only the knob connection can be forgotten from the TV."
+        }
+        if (rememberedDevice?.id == deviceId) rememberedDevice = null
+        disconnect(deviceId)
+        // Invalidate the connection before persistence is cleared. Late snapshots carry the
+        // old generation and cannot save this device again.
+        onForgotten(deviceId)
     }
 
     override suspend fun setMode(deviceId: String, mode: TrainingMode) =
@@ -214,59 +330,123 @@ class KnobVoltraController(
         mode: TrainingMode?,
         parameter: Parameter?,
         value: Int,
-    ) =
-        commands.withLock {
-            check(job.isActive)
-            val current = requireNotNull(snapshot) { "Connect the knob first." }
-            val trainer =
-                state.value.trainers.singleOrNull { it.device.id == deviceId }
-                    ?: error("Select the knob's active trainer.")
-            check(now() - receivedAt <= 2000 && trainer.fresh) { "Wait for fresh knob readings." }
-            check(
-                if (mode != null) trainer.canChangeMode
-                else trainer.canEdit(requireNotNull(parameter))
-            ) {
-                "This setting cannot be changed in the current trainer state."
+    ) = connectionCommand {
+        check(job.isActive)
+        val current = requireNotNull(snapshot) { "Connect the knob first." }
+        val trainer =
+            state.value.trainers.singleOrNull { it.device.id == deviceId }
+                ?: error("Select the knob's active trainer.")
+        check(now() - receivedAt <= 2000 && trainer.fresh) { "Wait for fresh knob readings." }
+        check(
+            if (mode != null) trainer.canChangeMode else trainer.canEdit(requireNotNull(parameter))
+        ) {
+            "This setting cannot be changed in the current trainer state."
+        }
+        check(nextId <= 65535) { "Reconnect the knob before sending more changes." }
+        val request = Pending(current.epoch, current.session, nextId++, CompletableDeferred())
+        pending = request
+        mutableState.update {
+            it.copy(trainers = it.trainers.map { trainer -> trainer.copy(pending = true) })
+        }
+        try {
+            requireNotNull(link)
+                .write(KnobProtocol.command(current, request.id, mode, parameter, value))
+            withTimeout(5000) {
+                request.completion.await()
+                snapshots.first { observed ->
+                    observed != null &&
+                        observed.epoch == current.epoch &&
+                        observed.session == current.session &&
+                        observed.trainer?.fresh == true &&
+                        !observed.trainer.pending &&
+                        if (mode != null) observed.trainer.mode == mode
+                        else observed.trainer.parameters[parameter] == value
+                }
+                Unit
             }
-            check(nextId <= 65535) { "Reconnect the knob before sending more changes." }
-            val request = Pending(current.epoch, current.session, nextId++, CompletableDeferred())
-            pending = request
+        } finally {
+            pending = null
             mutableState.update {
-                it.copy(trainers = it.trainers.map { trainer -> trainer.copy(pending = true) })
-            }
-            try {
-                requireNotNull(link)
-                    .write(KnobProtocol.command(current, request.id, mode, parameter, value))
-                withTimeout(5000) {
-                    request.completion.await()
-                    snapshots.first { observed ->
-                        observed != null &&
-                            observed.epoch == current.epoch &&
-                            observed.session == current.session &&
-                            observed.trainer?.fresh == true &&
-                            !observed.trainer.pending &&
-                            if (mode != null) observed.trainer.mode == mode
-                            else observed.trainer.parameters[parameter] == value
-                    }
-                    Unit
-                }
-            } finally {
-                pending = null
-                mutableState.update {
-                    it.copy(
-                        trainers =
-                            it.trainers.map { trainer ->
-                                trainer.copy(pending = snapshot?.trainer?.pending ?: false)
-                            }
-                    )
-                }
+                it.copy(
+                    trainers =
+                        it.trainers.map { trainer ->
+                            trainer.copy(pending = snapshot?.trainer?.pending ?: false)
+                        }
+                )
             }
         }
+    }
 
-    override suspend fun createTwin(controllerId: String, peerId: String): Unit =
-        error("Native Twin setup is not supported by the knob bridge.")
+    override suspend fun createTwin(controllerId: String, peerId: String) =
+        changeTwin(true, controllerId, peerId)
 
-    override suspend fun exitTwin(): Unit = error("Exit Twin on the trainers.")
+    override suspend fun exitTwin() = changeTwin(false)
+
+    private suspend fun changeTwin(
+        create: Boolean,
+        controllerId: String? = null,
+        peerId: String? = null,
+    ) = connectionCommand {
+        val current = requireNotNull(snapshot) { "Connect the knob first." }
+        if (create)
+            require(current.trainer?.device?.id == controllerId && current.peer?.id == peerId) {
+                "The knob's selected trainers changed. Check the current pair before retrying."
+            }
+        check(job.isActive && now() - receivedAt <= 2000)
+        check(
+            if (create) state.value.canCreateTwin && current.canCreateTwin
+            else state.value.canExitTwin && current.canExitTwin
+        ) {
+            "Finish training on both trainers before changing Twin mode."
+        }
+        check(nextId <= 65535)
+        val request = Pending(current.epoch, current.session, nextId++, CompletableDeferred())
+        pending = request
+        mutableState.update { it.copy(twinPending = true) }
+        try {
+            requireNotNull(link).write(KnobProtocol.twinCommand(current, request.id, create))
+            withTimeout(45_000) {
+                request.completion.await()
+                snapshots.first { update ->
+                    update != null &&
+                        update.epoch == current.epoch &&
+                        update.session == current.session &&
+                        update.trainer?.fresh == true &&
+                        update.trainer.twinStatusKnown &&
+                        !update.trainer.pending &&
+                        (if (create)
+                            update.trainer.twinVerified && update.peer?.id == current.peer?.id
+                        else !update.trainer.twinReported)
+                }
+                Unit
+            }
+        } finally {
+            pending = null
+            mutableState.update {
+                it.copy(
+                    twinPending = false,
+                    trainers =
+                        it.trainers.map { trainer ->
+                            trainer.copy(pending = snapshot?.trainer?.pending ?: false)
+                        },
+                )
+            }
+        }
+    }
+
+    private suspend fun <T> connectionCommand(block: suspend () -> T): T = coroutineScope {
+        val token = generation
+        val operation = currentCoroutineContext().job
+        commandJobs += operation
+        try {
+            commands.withLock {
+                check(token == generation) { "Knob connection changed. Retry the setting." }
+                block()
+            }
+        } finally {
+            commandJobs -= operation
+        }
+    }
 
     override fun beginSet() {
         baseline = snapshot?.trainer?.reps ?: 0

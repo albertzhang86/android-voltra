@@ -16,6 +16,7 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
     override val state = mutableState.asStateFlow()
     private var tick = 0
     private val commands = Mutex()
+    private var generation = 0
 
     init {
         scope.launch {
@@ -23,16 +24,28 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
                 delay(250)
                 tick++
                 mutableState.update { old ->
-                    old.copy(
-                        trainers =
-                            old.trainers.mapIndexed { index, trainer ->
-                                val base = trainer.setWeightLb ?: 30
-                                trainer.copy(
-                                    activeWeightLb = base * (0.75 + 0.25 * sin(tick / 3.0 + index)),
-                                    reps = tick / 20,
-                                )
-                            }
-                    )
+                    val trainers =
+                        old.trainers.mapIndexed { index, trainer ->
+                            val base = trainer.setWeightLb ?: 30
+                            val ready = trainer.connected && trainer.fresh && old.twin?.health != TwinHealth.DEGRADED
+                            val target = (base * (0.75 + 0.25 * sin(tick / 3.0 + index))).takeIf { ready && trainer.loaded }
+                            trainer.copy(
+                                activeWeightLb = if (ready && trainer.fitnessMode == 4) 0.0 else target,
+                                activeWeightSource = when {
+                                    ready && trainer.fitnessMode == 4 -> ActiveWeightSource.UNLOADED
+                                    target != null -> ActiveWeightSource.TARGET_FORCE
+                                    else -> null
+                                },
+                                resistanceTargetLb = target,
+                                reps =
+                                    (tick / 20).takeIf {
+                                        trainer.connected &&
+                                            trainer.fresh &&
+                                            old.twin?.health != TwinHealth.DEGRADED
+                                    },
+                            )
+                        }
+                    old.copy(trainers = trainers, twin = telemetry(old.twin, trainers))
                 }
             }
         }
@@ -57,6 +70,7 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
                             parameters = defaults,
                             batteryPercent = if (device == devices.first()) 86 else 72,
                             activeWeightLb = 0.0,
+                            activeWeightSource = ActiveWeightSource.UNLOADED,
                             reps = 0,
                             fitnessMode = 4,
                             fresh = true,
@@ -65,11 +79,69 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
                         )
             )
         }
+        mutableState.update { old ->
+            val pair = old.twin
+            if (pair == null || old.trainers.size != 2 || old.trainers.any { !it.connected }) old
+            else
+                old.copy(
+                    twin = pair.copy(health = TwinHealth.READY),
+                    trainers =
+                        old.trainers.map {
+                            it.copy(
+                                twinReported = true,
+                                twinVerified = true,
+                                twinRole =
+                                    if (it.device.id == pair.controllerId) TwinRole.CONTROLLER
+                                    else TwinRole.PEER,
+                            )
+                        },
+                )
+        }
     }
 
     override fun disconnect(deviceId: String) {
+        generation++
         mutableState.update {
-            it.copy(trainers = it.trainers.filterNot { s -> s.device.id == deviceId }, twin = null)
+            val paired =
+                it.twin?.let { pair -> deviceId in listOf(pair.controllerId, pair.peerId) } == true
+            it.copy(
+                trainers =
+                    it.trainers
+                        .filterNot { s -> s.device.id == deviceId }
+                        .map { trainer ->
+                            if (paired)
+                                trainer.copy(
+                                    twinVerified = false,
+                                    activeWeightLb = null,
+                                    activeWeightSource = null,
+                                    resistanceTargetLb = null,
+                                    reps = null,
+                                )
+                            else trainer
+                        },
+                twin =
+                    if (paired)
+                        it.twin?.copy(
+                            health = TwinHealth.DEGRADED,
+                            activeWeightLb = null,
+                            reps = null,
+                            setWeightLb = null,
+                        )
+                    else it.twin,
+            )
+        }
+    }
+
+    override fun forget(deviceId: String) {
+        generation++
+        mutableState.update { current ->
+            val pair = current.twin?.takeIf { deviceId in listOf(it.controllerId, it.peerId) }
+            val ids = pair?.let { setOf(it.controllerId, it.peerId) } ?: setOf(deviceId)
+            current.copy(
+                trainers = current.trainers.filterNot { it.device.id in ids },
+                twin = current.twin.takeIf { pair == null },
+                twinPending = false,
+            )
         }
     }
 
@@ -95,16 +167,24 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
     }
 
     private suspend fun edit(deviceId: String, transform: (TrainerState) -> TrainerState) =
-        commands.withLock {
+        serialCommand {
             check(job.isActive)
             val pair = state.value.twin
+            check(pair == null || pair.health == TwinHealth.READY) {
+                "Restore both Twin connections first."
+            }
             require(pair == null || deviceId == pair.controllerId)
             require(state.value.trainers.any { it.device.id == deviceId })
             val ids = if (pair == null) setOf(deviceId) else setOf(pair.controllerId, pair.peerId)
+            val token = generation
+            val changed = transform(state.value.trainers.single { it.device.id == deviceId })
             val updated =
                 state.value.trainers
                     .filter { it.device.id in ids }
-                    .associate { it.device.id to transform(it) }
+                    .associate { trainer ->
+                        trainer.device.id to
+                            trainer.copy(mode = changed.mode, parameters = changed.parameters)
+                    }
             mutableState.update {
                 it.copy(
                     trainers =
@@ -115,19 +195,26 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
             }
             try {
                 delay(180)
-                check(job.isActive && state.value.trainers.map { it.device.id }.containsAll(ids))
+                check(
+                    job.isActive &&
+                        token == generation &&
+                        state.value.trainers.map { it.device.id }.containsAll(ids)
+                )
                 mutableState.update {
                     it.copy(
                         trainers =
                             it.trainers.map { s ->
                                 updated[s.device.id]?.copy(
                                     activeWeightLb = s.activeWeightLb,
+                                    activeWeightSource = s.activeWeightSource,
+                                    resistanceTargetLb = s.resistanceTargetLb,
                                     reps = s.reps,
                                     pending = false,
                                 ) ?: s
                             }
                     )
                 }
+                mutableState.update { it.copy(twin = telemetry(it.twin, it.trainers)) }
             } finally {
                 mutableState.update {
                     it.copy(trainers = it.trainers.map { s -> s.copy(pending = false) })
@@ -135,58 +222,124 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
             }
         }
 
-    override suspend fun createTwin(controllerId: String, peerId: String) =
-        commands.withLock {
-            check(job.isActive && state.value.twin == null)
-            require(
-                controllerId != peerId &&
-                    state.value.trainers
-                        .map { it.device.id }
-                        .containsAll(listOf(controllerId, peerId))
-            )
-            check(state.value.trainers.all { it.canChangeMode })
-            mutableState.update { it.copy(twinPending = true) }
-            try {
-                delay(300)
-                check(job.isActive && state.value.trainers.size == 2)
-                val controller = state.value.trainers.first { it.device.id == controllerId }
-                mutableState.update {
-                    it.copy(
-                        twin = TwinPair(controllerId, peerId),
-                        trainers =
-                            it.trainers.map { s ->
-                                s.copy(mode = controller.mode, parameters = controller.parameters)
-                            },
-                    )
-                }
-            } finally {
-                mutableState.update { it.copy(twinPending = false) }
+    override suspend fun createTwin(controllerId: String, peerId: String) = serialCommand {
+        check(job.isActive && state.value.canCreateTwin)
+        require(
+            controllerId != peerId &&
+                state.value.trainers.map { it.device.id }.containsAll(listOf(controllerId, peerId))
+        )
+        val token = generation
+        mutableState.update { it.copy(twinPending = true) }
+        try {
+            delay(300)
+            check(job.isActive && token == generation && state.value.trainers.size == 2)
+            val controller = state.value.trainers.first { it.device.id == controllerId }
+            mutableState.update {
+                it.copy(
+                    twin = TwinPair(controllerId, peerId),
+                    trainers =
+                        it.trainers.map { s ->
+                            s.copy(
+                                mode = controller.mode,
+                                parameters = controller.parameters,
+                                twinReported = true,
+                                twinVerified = true,
+                                twinRole =
+                                    if (s.device.id == controllerId) TwinRole.CONTROLLER
+                                    else TwinRole.PEER,
+                            )
+                        },
+                )
             }
+            mutableState.update { it.copy(twin = telemetry(it.twin, it.trainers)) }
+        } finally {
+            mutableState.update { it.copy(twinPending = false) }
         }
+    }
 
-    override suspend fun exitTwin() =
-        commands.withLock {
-            check(job.isActive && state.value.twin != null)
-            mutableState.update { it.copy(twinPending = true) }
-            try {
-                delay(300)
-                mutableState.update { it.copy(twin = null) }
-            } finally {
-                mutableState.update { it.copy(twinPending = false) }
-            }
+    override suspend fun exitTwin() = serialCommand {
+        check(job.isActive && state.value.canExitTwin) {
+            "Both Twin trainers must be connected, fresh and unloaded."
         }
+        val token = generation
+        mutableState.update { it.copy(twinPending = true) }
+        try {
+            delay(300)
+            check(job.isActive && token == generation)
+            mutableState.update {
+                it.copy(
+                    twin = null,
+                    trainers =
+                        it.trainers.map { trainer ->
+                            trainer.copy(
+                                twinReported = false,
+                                twinRole = null,
+                                twinVerified = false,
+                            )
+                        },
+                )
+            }
+        } finally {
+            mutableState.update { it.copy(twinPending = false) }
+        }
+    }
+
+    private suspend fun <T> serialCommand(block: suspend () -> T): T {
+        val token = generation
+        return commands.withLock {
+            check(token == generation) { "Device connection changed." }
+            block()
+        }
+    }
 
     override fun beginSet() {
         tick = 0
-        mutableState.update { it.copy(trainers = it.trainers.map { s -> s.copy(reps = 0) }) }
+        mutableState.update {
+            it.copy(
+                trainers = it.trainers.map { s ->
+                    s.copy(reps = 0, fitnessMode = 5, activeWeightLb = null,
+                        activeWeightSource = null, resistanceTargetLb = null)
+                },
+                twin =
+                    it.twin?.let { pair ->
+                        pair.copy(reps = if (pair.health == TwinHealth.READY) 0 else null)
+                    },
+            )
+        }
     }
 
     override fun close() {
+        generation++
         job.cancel()
         mutableState.value = VoltraState(isSimulated = true)
     }
 
     companion object {
+        private fun telemetry(pair: TwinPair?, trainers: List<TrainerState>): TwinPair? {
+            if (pair == null) return null
+            val controller = trainers.find { it.device.id == pair.controllerId }
+            val peer = trainers.find { it.device.id == pair.peerId }
+            if (
+                pair.health != TwinHealth.READY ||
+                    controller?.fresh != true ||
+                    peer?.fresh != true ||
+                    !controller.connected ||
+                    !peer.connected
+            )
+                return pair.copy(
+                    health = TwinHealth.DEGRADED,
+                    activeWeightLb = null,
+                    reps = null,
+                    setWeightLb = null,
+                )
+            return pair.copy(
+                activeWeightLb =
+                    controller.activeWeightLb?.let { a -> peer.activeWeightLb?.let { a + it } },
+                reps = controller.reps,
+                setWeightLb = controller.setWeightLb?.let { a -> peer.setWeightLb?.let { a + it } },
+            )
+        }
+
         val devices =
             listOf(
                 VoltraDevice("demo-left", "VOLTRA Left"),
