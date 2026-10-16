@@ -9,6 +9,23 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class SimulatedVoltraControllerTest {
     @Test
+    fun `Twin band maximum is shared and total simulated force stays within that maximum`() = runTest {
+        val controller = SimulatedVoltraController(backgroundScope)
+        SimulatedVoltraController.devices.forEach { controller.connect(it) }
+        controller.createTwin("demo-left", "demo-right")
+        controller.setMode("demo-left", TrainingMode.BAND)
+        controller.setParameter("demo-left", Parameter.BAND_MAXIMUM, 40)
+        controller.beginSet()
+        advanceTimeBy(5_100)
+        runCurrent()
+        val state = controller.state.value
+        assertEquals(40, state.twin?.setWeightLb)
+        assertTrue(state.trainers.all { it.setWeightLb == 40 })
+        assertTrue(requireNotNull(state.twin?.activeWeightLb) in 0.0..40.0)
+        controller.close()
+    }
+
+    @Test
     fun `finished demo sets become unloaded so the next exercise can enter and exit Twin`() =
         runTest {
             for (viaKnob in listOf(false, true)) {

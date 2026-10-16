@@ -202,8 +202,9 @@ class DirectVoltraController(
                 TrainingMode.fromWire(update.registers.getValue(VoltraProtocol.MODE))
             } else entry.snapshot.mode
         val nextFitness = update.registers[VoltraProtocol.FITNESS] ?: entry.snapshot.fitnessMode
+        val modeChanged = VoltraProtocol.MODE in update.registers && nextMode != entry.snapshot.mode
         if (
-            (VoltraProtocol.MODE in update.registers && nextMode != entry.snapshot.mode) ||
+            modeChanged ||
                 (VoltraProtocol.FITNESS in update.registers &&
                     update.registers[VoltraProtocol.FITNESS] != entry.snapshot.fitnessMode)
         ) {
@@ -292,7 +293,10 @@ class DirectVoltraController(
             }
         }
         change(entry) { old ->
-            val parameters = old.parameters.toMutableMap()
+            // A newly confirmed mode needs fresh parameter readback. A rapid return to a
+            // previous mode must not reuse its still-young cache and skip required setup.
+            if (modeChanged) entry.parameterAt.clear()
+            val parameters = if (modeChanged) mutableMapOf() else old.parameters.toMutableMap()
             Parameter.entries.forEach { parameter ->
                 update.registers[parameter.register]?.let { value ->
                     if (runCatching { parameter.validate(value) }.isSuccess) {

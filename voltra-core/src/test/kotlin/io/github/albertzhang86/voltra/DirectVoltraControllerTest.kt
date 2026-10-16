@@ -303,6 +303,38 @@ class DirectVoltraControllerTest {
     }
 
     @Test
+    fun `mode changes invalidate cached settings until the new mode reports them again`() =
+        runTest {
+            val rig = Rig(this)
+            rig.ready()
+            assertEquals(30, rig.trainer().parameters[Parameter.WEIGHT])
+            rig.link().send(report(VoltraProtocol.MODE, TrainingMode.BAND.wireValue, 2))
+            runCurrent()
+            assertEquals(TrainingMode.BAND, rig.trainer().mode)
+            assertTrue(rig.trainer().parameters.isEmpty())
+
+            rig.link().send(report(Parameter.BAND_MAXIMUM.register, 90, 2))
+            runCurrent()
+            assertEquals(mapOf(Parameter.BAND_MAXIMUM to 90), rig.trainer().parameters)
+            // Ordinary repeat mode/status reports do not erase current confirmed settings.
+            rig.link().send(report(VoltraProtocol.MODE, TrainingMode.BAND.wireValue, 2))
+            rig.link().send(report(VoltraProtocol.FITNESS, 5, 2))
+            runCurrent()
+            assertEquals(90, rig.trainer().parameters[Parameter.BAND_MAXIMUM])
+
+            // Switch back inside the 3.5-second cache lifetime; the former 30 lb is unavailable.
+            rig.link().send(report(VoltraProtocol.MODE, TrainingMode.WEIGHT.wireValue, 2))
+            runCurrent()
+            assertTrue(rig.trainer().parameters.isEmpty())
+            assertNull(rig.trainer().setWeightLb)
+            rig.link().send(report(Parameter.WEIGHT.register, 55, 2))
+            runCurrent()
+            assertEquals(mapOf(Parameter.WEIGHT to 55), rig.trainer().parameters)
+            assertFalse(rig.trainer().canEdit(Parameter.ECCENTRIC))
+            rig.controller.close()
+        }
+
+    @Test
     fun `two trainers change independently and reject a third`() = runTest {
         val rig = Rig(this)
         rig.ready(2)

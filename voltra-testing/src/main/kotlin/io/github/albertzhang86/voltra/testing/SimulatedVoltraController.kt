@@ -31,7 +31,12 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
                 mutableState.update { old ->
                     val trainers =
                         old.trainers.mapIndexed { index, trainer ->
-                            val base = trainer.setWeightLb ?: 30
+                            val configured = (trainer.setWeightLb ?: 30).toDouble()
+                            // Band maximum is shared by the pair; each cable contributes half.
+                            val base =
+                                if (old.twin != null && trainer.mode == TrainingMode.BAND)
+                                    configured / 2
+                                else configured
                             val ready =
                                 trainer.connected &&
                                     trainer.fresh &&
@@ -396,7 +401,11 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
                 activeWeightLb =
                     controller.activeWeightLb?.let { a -> peer.activeWeightLb?.let { a + it } },
                 reps = controller.reps,
-                setWeightLb = controller.setWeightLb?.let { a -> peer.setWeightLb?.let { a + it } },
+                setWeightLb =
+                    if (controller.mode != peer.mode) null
+                    else if (controller.mode == TrainingMode.BAND)
+                        controller.setWeightLb?.takeIf { it == peer.setWeightLb }
+                    else controller.setWeightLb?.let { a -> peer.setWeightLb?.let { a + it } },
             )
         }
 
