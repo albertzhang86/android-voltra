@@ -314,6 +314,7 @@ class DirectVoltraController(
             old.copy(
                 parameters = parameters,
                 mode = nextMode,
+                modeWireValue = update.registers[VoltraProtocol.MODE] ?: old.modeWireValue,
                 fitnessMode = update.registers[VoltraProtocol.FITNESS] ?: old.fitnessMode,
                 weightUnit =
                     if (VoltraProtocol.WEIGHT_UNIT in update.registers)
@@ -734,6 +735,7 @@ class DirectVoltraController(
                         status =
                             if (ready) ConnectionStatus.READY else ConnectionStatus.DISCONNECTED,
                         mode = primary.mode,
+                        modeWireValue = primary.modeWireValue,
                         parameters = primary.parameters,
                         batteryPercent = endpoint?.peerBatteryPercent,
                         fitnessMode = primary.fitnessMode,

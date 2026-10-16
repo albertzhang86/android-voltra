@@ -12,6 +12,185 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class KnobControllerTest {
+    @Test
+    fun `knob Twin requests are session bound deduplicated and never replayed`() = runTest {
+        val link = Link()
+        val controller = controller(link)
+        val events = mutableListOf<KnobTwinRequest>()
+        backgroundScope.launch { controller.twinRequests.collect { events += it } }
+        controller.connect(knob)
+        runCurrent()
+        val packet = twinSnapshot().also { it[3] = (it[3].toInt() or 0x60).toByte() }
+        link.incoming.send(packet)
+        runCurrent()
+        fun event(id: Int, epochDelta: Int = 0, sessionDelta: Int = 0): ByteArray {
+            val decoded = KnobProtocol.snapshot(packet)
+            return ByteBuffer.allocate(20)
+                .order(ByteOrder.LITTLE_ENDIAN)
+                .apply {
+                    put(0x4b)
+                    put(2)
+                    put(8)
+                    put(0)
+                    putInt(decoded.epoch + epochDelta)
+                    putInt(decoded.session + sessionDelta)
+                    putShort(id.toShort())
+                    put(byteArrayOf(1, 2, 3, 4, 5, 7))
+                }
+                .array()
+        }
+        for (bytes in
+            listOf(event(1), event(1), event(2, epochDelta = 1), event(2, sessionDelta = 1))) link
+            .incoming
+            .send(bytes)
+        runCurrent()
+        assertEquals(listOf(1), events.map { it.id })
+        advanceTimeBy(2250)
+        runCurrent()
+        link.incoming.send(event(2))
+        runCurrent()
+        assertEquals(1, events.size)
+        link.incoming.send(packet)
+        runCurrent()
+        link.incoming.send(event(2))
+        runCurrent()
+        assertEquals(listOf(1, 2), events.map { it.id })
+        assertTrue(link.writes.isEmpty())
+        controller.close()
+    }
+
+    @Test
+    fun `trusted peer offer expires and status references request without native pairing writes`() =
+        runTest {
+            val link = Link()
+            val controller = controller(link)
+            controller.connect(knob)
+            runCurrent()
+            val packet = twinSnapshot().also { it[3] = (it[3].toInt() or 0x60).toByte() }
+            link.incoming.send(packet)
+            runCurrent()
+            val snapshot = KnobProtocol.snapshot(packet)
+            assertTrue(controller.state.value.knob!!.mixedTwinHandoffSupported)
+            controller.offerTwinPeer(snapshot.peer)
+            val offer = ByteBuffer.wrap(link.writes.single()).order(ByteOrder.LITTLE_ENDIAN)
+            assertEquals(7, offer.get(2).toInt())
+            assertEquals(snapshot.uptime + 1500, offer.getInt(12))
+            assertEquals(0, offer.getShort(16).toInt())
+            assertEquals(1, offer.get(3).toInt())
+            assertArrayEquals(
+                byteArrayOf(1, 2, 3, 4, 5, 7),
+                link.writes.single().copyOfRange(18, 24),
+            )
+            val request = KnobTwinRequest(snapshot.epoch, snapshot.session, 17, snapshot.peer!!.id)
+            controller.reportTwinRequest(request, KnobTwinRequestStatus.ACCEPTED)
+            assertEquals(9, link.writes.last()[2].toInt())
+            val status = ByteBuffer.wrap(link.writes.last()).order(ByteOrder.LITTLE_ENDIAN)
+            assertEquals(1, status.getShort(18).toInt())
+            assertEquals(1, status.getShort(16).toInt())
+            assertEquals(17, status.getInt(20))
+            controller.reportTwinRequest(
+                request.copy(epoch = snapshot.epoch + 1),
+                KnobTwinRequestStatus.SUCCEEDED,
+            )
+            assertEquals(2, link.writes.size)
+            controller.offerTwinPeer(null)
+            assertArrayEquals(ByteArray(6), link.writes.last().copyOfRange(18, 24))
+            assertTrue(link.writes.none { it[2].toInt() in 5..6 })
+            controller.close()
+        }
+
+    @Test
+    fun `guarded Twin commands bind the exact peer without reusing legacy weight flags`() {
+        val legacy = twinSnapshot().also { it[133] = (it[133].toInt() or 0x10).toByte() }
+        assertFalse(KnobProtocol.snapshot(legacy).twinIdentityGuarded)
+        assertArrayEquals(
+            ByteArray(6),
+            KnobProtocol.twinCommand(KnobProtocol.snapshot(twinSnapshot()), 1, true)
+                .copyOfRange(18, 24),
+        )
+        val guarded = twinSnapshot().also { it[3] = (it[3].toInt() or 0x20).toByte() }
+        assertTrue(KnobProtocol.snapshot(guarded).twinIdentityGuarded)
+        assertArrayEquals(
+            byteArrayOf(1, 2, 3, 4, 5, 7),
+            KnobProtocol.twinCommand(KnobProtocol.snapshot(guarded), 2, true).copyOfRange(18, 24),
+        )
+        val paired = twinSnapshot(paired = true).also { it[3] = (it[3].toInt() or 0x20).toByte() }
+        assertArrayEquals(
+            ByteArray(6),
+            KnobProtocol.twinCommand(KnobProtocol.snapshot(paired), 3, false).copyOfRange(18, 24),
+        )
+    }
+
+    @Test
+    fun `handoff candidate requires explicit command flag and exact peer guard`() {
+        val packet = twinSnapshot().also { it[3] = (it[3].toInt() or 0xe0).toByte() }
+        val snapshot = KnobProtocol.snapshot(packet)
+        assertTrue(snapshot.twinPeerHandoff)
+        val command = KnobProtocol.twinCommand(snapshot, 1, true)
+        assertEquals(1, command[3].toInt())
+        assertArrayEquals(byteArrayOf(1, 2, 3, 4, 5, 7), command.copyOfRange(18, 24))
+        assertTrue(
+            runCatching {
+                    KnobProtocol.twinCommand(snapshot.copy(twinIdentityGuarded = false), 1, true)
+                }
+                .isFailure
+        )
+        assertTrue(
+            runCatching {
+                    KnobProtocol.twinCommand(
+                        snapshot.copy(mixedTwinHandoffSupported = false),
+                        1,
+                        true,
+                    )
+                }
+                .isFailure
+        )
+    }
+
+    @Test
+    fun `ownership heartbeat stays writable during native Twin and does not consume control ids`() =
+        runTest {
+            val link = Link()
+            val controller = controller(link)
+            controller.connect(knob)
+            runCurrent()
+            val packet = twinSnapshot().also { it[3] = (it[3].toInt() or 0xe0).toByte() }
+            link.incoming.send(packet)
+            runCurrent()
+            val snapshot = KnobProtocol.snapshot(packet)
+            repeat(100) { controller.offerTwinPeer(snapshot.peer, ready = it % 2 == 0) }
+            assertTrue(
+                link.writes.all {
+                    ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).getShort(16).toInt() == 0
+                }
+            )
+            assertEquals(0, link.writes.last()[3].toInt()) // Ownership retained, readiness revoked.
+            assertArrayEquals(byteArrayOf(1, 2, 3, 4, 5, 7), link.writes.last().copyOfRange(18, 24))
+            val deadlines =
+                link.writes.map { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).getInt(12) }
+            assertTrue(deadlines.zipWithNext().all { (before, after) -> after - before > 0 })
+            val create = async { controller.createTwin(trainer, snapshot.peer!!.id) }
+            runCurrent()
+            val command = link.writes.last()
+            assertEquals(5, command[2].toInt())
+            assertEquals(
+                1,
+                ByteBuffer.wrap(command).order(ByteOrder.LITTLE_ENDIAN).getShort(16).toInt(),
+            )
+            controller.offerTwinPeer(snapshot.peer)
+            assertEquals(7, link.writes.last()[2].toInt())
+            assertFalse(create.isCompleted)
+            link.incoming.send(ack(command, 1))
+            link.incoming.send(
+                twinSnapshot(paired = true, uptime = 1100).also {
+                    it[3] = (it[3].toInt() or 0x60).toByte()
+                }
+            )
+            runCurrent()
+            create.await()
+            controller.close()
+        }
+
     private val knob = VoltraDevice("knob", "Test knob")
     private val trainer = "01:02:03:04:05:06"
 
@@ -310,6 +489,223 @@ class KnobControllerTest {
         return bytes
     }
 
+    private fun pairTelemetrySnapshot(
+        force: Int = 245,
+        reps: Int = 6,
+        loaded: Boolean = true,
+        pending: Boolean = false,
+        peer: String = "AA:BB:CC:DD:EE:02",
+        mode: Int = 1,
+    ): ByteArray =
+        twinSnapshot(paired = true, pending = pending).also {
+            "AA:BB:CC:DD:EE:01".toByteArray().copyInto(it, 64)
+            peer.toByteArray().copyInto(it, 114)
+            it[19] = mode.toByte()
+            ByteBuffer.wrap(it)
+                .order(ByteOrder.LITTLE_ENDIAN)
+                .putShort(20, (if (loaded) 5 else 4).toShort())
+                .putInt(22, force)
+                .putShort(26, reps.toShort())
+            it[133] = (2 or 8 or 0x80).toByte()
+        }
+
+    @Test
+    fun `paired classified telemetry is logical and never copied into physical trainer sensors`() =
+        runTest {
+            val link = Link()
+            val controller = controller(link)
+            controller.connect(knob)
+            runCurrent()
+            link.incoming.send(pairTelemetrySnapshot())
+            runCurrent()
+            val state = controller.state.value
+            assertEquals(24.5, state.twin!!.measuredForceLb!!, 0.001)
+            assertEquals(true, state.twin!!.cableMoving)
+            assertEquals(6, state.twin!!.deviceReps)
+            assertEquals(6, state.twin!!.reps)
+            assertNull(state.twin!!.activeWeightLb)
+            state.trainers.forEach {
+                assertNull(it.activeWeightLb)
+                assertNull(it.measuredForceLb)
+                assertNull(it.cableMoving)
+                assertNull(it.deviceReps)
+                assertNull(it.reps)
+            }
+            controller.beginSet()
+            assertEquals(0, controller.state.value.twin!!.reps)
+            assertEquals(6, controller.state.value.twin!!.deviceReps)
+            link.incoming.send(pairTelemetrySnapshot(reps = 8))
+            runCurrent()
+            assertEquals(2, controller.state.value.twin!!.reps)
+            assertEquals(8, controller.state.value.twin!!.deviceReps)
+            // The trainer begins a new native set; do not subtract the previous set's baseline.
+            link.incoming.send(pairTelemetrySnapshot(reps = 1))
+            runCurrent()
+            assertEquals(1, controller.state.value.twin!!.reps)
+            controller.close()
+        }
+
+    @Test
+    fun `Twin telemetry requires exact verified fresh topology and classified loaded movement`() {
+        val valid = pairTelemetrySnapshot()
+        assertEquals(24.5, KnobProtocol.snapshot(valid).twinMeasuredForceLb!!, 0.001)
+        assertEquals(6, KnobProtocol.snapshot(valid).twinDeviceReps)
+        val invalid =
+            listOf<(ByteArray) -> Unit>(
+                { it[3] = (it[3].toInt() and 1.inv()).toByte() },
+                { it[3] = (it[3].toInt() and 2.inv()).toByte() },
+                { it[3] = (it[3].toInt() and 8.inv()).toByte() },
+                { it[3] = (it[3].toInt() and 16.inv()).toByte() },
+                { it[3] = (it[3].toInt() or 4).toByte() },
+                { it[19] = 0 },
+                { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putShort(20, 0) },
+            )
+        invalid.forEach { change ->
+            val parsed = KnobProtocol.snapshot(valid.copyOf().also(change))
+            assertNull(parsed.twinMeasuredForceLb)
+            assertNull(parsed.twinDeviceReps)
+        }
+        // Unload removes moving force without discarding the real device's final count.
+        val unloaded = KnobProtocol.snapshot(pairTelemetrySnapshot(loaded = false))
+        assertNull(unloaded.twinMeasuredForceLb)
+        assertEquals(6, unloaded.twinDeviceReps)
+        for (flag in listOf(0, 0x10, 0x40)) {
+            val unclassified = valid.copyOf().also { it[133] = (2 or 8 or flag).toByte() }
+            assertNull(KnobProtocol.snapshot(unclassified).twinMeasuredForceLb)
+        }
+        val unavailable = KnobProtocol.snapshot(pairTelemetrySnapshot(force = -1, reps = 65535))
+        assertNull(unavailable.twinMeasuredForceLb)
+        assertNull(unavailable.twinDeviceReps)
+        assertTrue(
+            runCatching {
+                    KnobProtocol.snapshot(
+                        valid.copyOf().also { "AA:BB:CC:DD:EE:01".toByteArray().copyInto(it, 114) }
+                    )
+                }
+                .isFailure
+        )
+    }
+
+    @Test
+    fun `pair motion expires after 500 ms and stale status clears pair counts`() = runTest {
+        val link = Link()
+        val controller = controller(link)
+        controller.connect(knob)
+        runCurrent()
+        link.incoming.send(pairTelemetrySnapshot())
+        runCurrent()
+        advanceTimeBy(500)
+        runCurrent()
+        assertNull(controller.state.value.twin!!.measuredForceLb)
+        assertNull(controller.state.value.twin!!.cableMoving)
+        assertEquals(6, controller.state.value.twin!!.deviceReps)
+        advanceTimeBy(1_750)
+        runCurrent()
+        assertEquals(TwinHealth.DEGRADED, controller.state.value.twin!!.health)
+        assertNull(controller.state.value.twin!!.deviceReps)
+        assertNull(controller.state.value.twin!!.reps)
+        link.incoming.send(pairTelemetrySnapshot())
+        runCurrent()
+        assertEquals(24.5, controller.state.value.twin!!.measuredForceLb!!, 0.001)
+        controller.disconnect(knob.id)
+        assertNull(controller.state.value.twin)
+        controller.close()
+    }
+
+    @Test
+    fun `pair source changes never inherit the prior pair or independent set baseline`() = runTest {
+        val link = Link()
+        val controller = controller(link)
+        controller.connect(knob)
+        runCurrent()
+        link.incoming.send(pairTelemetrySnapshot(reps = 10))
+        runCurrent()
+        controller.beginSet()
+        link.incoming.send(pairTelemetrySnapshot(reps = 12))
+        runCurrent()
+        assertEquals(2, controller.state.value.twin!!.reps)
+        link.incoming.send(pairTelemetrySnapshot(reps = 3, peer = "AA:BB:CC:DD:EE:03"))
+        runCurrent()
+        assertEquals(3, controller.state.value.twin!!.reps)
+        controller.beginSet()
+        link.incoming.send(pairTelemetrySnapshot(reps = 2, peer = "AA:BB:CC:DD:EE:03", mode = 2))
+        runCurrent()
+        assertEquals(2, controller.state.value.twin!!.reps)
+        link.incoming.send(twinSnapshot())
+        runCurrent()
+        assertNull(controller.state.value.twin)
+        assertEquals(10, controller.state.value.trainers.single().reps)
+        controller.close()
+    }
+
+    @Test
+    fun `first Twin rep after an unknown baseline counts once without changing raw count`() =
+        runTest {
+            val link = Link()
+            val controller = controller(link)
+            controller.connect(knob)
+            runCurrent()
+            link.incoming.send(pairTelemetrySnapshot(reps = 65535))
+            runCurrent()
+            controller.beginSet()
+            assertNull(controller.state.value.twin!!.reps)
+            link.incoming.send(pairTelemetrySnapshot(reps = 8))
+            runCurrent()
+            assertEquals(1, controller.state.value.twin!!.reps)
+            assertEquals(8, controller.state.value.twin!!.deviceReps)
+            link.incoming.send(pairTelemetrySnapshot(reps = 8))
+            runCurrent()
+            assertEquals(1, controller.state.value.twin!!.reps)
+            controller.close()
+        }
+
+    @Test
+    fun `missing pair count preserves the known set baseline without inventing reps`() = runTest {
+        val link = Link()
+        val controller = controller(link)
+        controller.connect(knob)
+        runCurrent()
+        link.incoming.send(pairTelemetrySnapshot(reps = 10))
+        runCurrent()
+        controller.beginSet()
+        link.incoming.send(pairTelemetrySnapshot(reps = 12))
+        runCurrent()
+        assertEquals(2, controller.state.value.twin!!.reps)
+        link.incoming.send(pairTelemetrySnapshot(reps = 65535))
+        runCurrent()
+        assertNull(controller.state.value.twin!!.reps)
+        assertNull(controller.state.value.twin!!.deviceReps)
+        link.incoming.send(snapshot().also { it[16] = 255.toByte() })
+        runCurrent()
+        assertTrue(controller.state.value.trainers.isEmpty())
+        link.incoming.send(pairTelemetrySnapshot(reps = 12))
+        runCurrent()
+        assertEquals(2, controller.state.value.twin!!.reps)
+        link.incoming.send(pairTelemetrySnapshot(reps = 13))
+        runCurrent()
+        assertEquals(3, controller.state.value.twin!!.reps)
+        assertEquals(13, controller.state.value.twin!!.deviceReps)
+        controller.close()
+    }
+
+    @Test
+    fun `v1 snapshots never read absent v2 pair telemetry extensions`() {
+        val legacy = snapshot()
+        assertEquals(1, legacy[1].toInt())
+        val decoded = KnobProtocol.snapshot(legacy)
+        assertNull(decoded.peer)
+        assertNull(decoded.twinMeasuredForceLb)
+        assertNull(decoded.twinDeviceReps)
+        assertEquals(10, decoded.trainer!!.deviceReps)
+        val minimal =
+            legacy.copyOf(82).also {
+                it[31] = 0
+                it[28] = 0
+                it[29] = 0
+            }
+        assertNull(KnobProtocol.snapshot(minimal).twinMeasuredForceLb)
+    }
+
     @Test
     fun `v2 paired snapshot supplies verified identity and both batteries without inventing telemetry`() =
         runTest {
@@ -366,6 +762,89 @@ class KnobControllerTest {
         assertNull(controller.state.value.twin)
         controller.close()
     }
+
+    @Test
+    fun `uppercase handoff identities match lowercase native confirmation without timing out`() =
+        runTest {
+            val link = Link()
+            val controller = controller(link)
+            controller.connect(knob)
+            runCurrent()
+            val controllerId = "80:65:99:92:7E:D1"
+            val peerId = "80:65:99:92:7E:E2"
+            fun packet(paired: Boolean, peer: String = peerId, local: String = controllerId) =
+                twinSnapshot(paired = paired).also {
+                    local.toByteArray().copyInto(it, 64)
+                    peer.toByteArray().copyInto(it, 114)
+                    it[3] = (it[3].toInt() or 0x60 or (if (paired) 0 else 0x80)).toByte()
+                }
+            link.incoming.send(packet(false))
+            runCurrent()
+            val epoch = controller.state.value.telemetryEpoch
+            // Callers may use canonical MAC casing independently from snapshot spelling.
+            val create = async {
+                controller.createTwin(controllerId.lowercase(), peerId.lowercase())
+            }
+            runCurrent()
+            val command = link.writes.single()
+            assertEquals(5, command[2].toInt())
+            assertEquals(1, command[3].toInt())
+            link.incoming.send(ack(command, 1))
+            runCurrent()
+            assertFalse(create.isCompleted)
+            // A genuinely different peer still cannot confirm the request.
+            link.incoming.send(packet(true, "80:65:99:92:7e:e3", controllerId.lowercase()))
+            runCurrent()
+            assertFalse(create.isCompleted)
+            link.incoming.send(packet(true, peerId.lowercase(), controllerId.lowercase()))
+            runCurrent()
+            assertTrue(
+                "Confirmed native pair must finish without waiting 45 seconds",
+                create.isCompleted,
+            )
+            create.await()
+            assertEquals(0L, testScheduler.currentTime)
+            assertEquals(epoch, controller.state.value.telemetryEpoch)
+            assertFalse(controller.state.value.twinPending)
+            assertTrue(controller.state.value.trainers.none { it.pending })
+            assertEquals(1, link.writes.size)
+            assertEquals(peerId.lowercase(), controller.state.value.twin?.peerId)
+            controller.close()
+        }
+
+    @Test
+    fun `controller address casing preserves reps pending settings and lifecycle identity`() =
+        runTest {
+            val link = Link()
+            val controller = controller(link)
+            controller.connect(knob)
+            runCurrent()
+            val trainerId = "AA:BB:CC:DD:EE:FF"
+            fun packet(id: String, weight: Int = 30, reps: Int = 10) =
+                snapshot(weight = weight, reps = reps).also { id.toByteArray().copyInto(it, 64) }
+            link.incoming.send(packet(trainerId))
+            runCurrent()
+            controller.beginSet()
+            val epoch = controller.state.value.telemetryEpoch
+            val setting = async {
+                controller.setParameter(trainerId.lowercase(), Parameter.WEIGHT, 35)
+            }
+            runCurrent()
+            val command = link.writes.single()
+            link.incoming.send(ack(command, 1))
+            link.incoming.send(packet(trainerId.lowercase(), weight = 35, reps = 12))
+            runCurrent()
+            assertTrue(setting.isCompleted)
+            setting.await()
+            assertEquals(epoch, controller.state.value.telemetryEpoch)
+            assertEquals(2, controller.state.value.trainers.single().reps)
+            // A relayed trainer cannot be forgotten using a different spelling either.
+            assertTrue(runCatching { controller.forget(trainerId) }.isFailure)
+            controller.disconnect(knob.id.uppercase())
+            assertEquals(ConnectionStatus.DISCONNECTED, controller.state.value.knob?.status)
+            assertTrue(link.closed)
+            controller.close()
+        }
 
     @Test
     fun `queued Twin request never switches its intended controller after a session change`() =
@@ -903,6 +1382,30 @@ class KnobControllerTest {
         assertEquals(ConnectionStatus.DISCONNECTED, controller.state.value.knob!!.status)
         assertEquals(1, link.writes.size)
         controller.close()
+    }
+
+    @Test
+    fun `bridge idle mode is distinct from unsupported mode for both unloaded states`() {
+        for (packet in listOf(snapshot(), twinSnapshot())) {
+            for (fitness in listOf(0, 4)) {
+                ByteBuffer.wrap(packet)
+                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .putShort(20, fitness.toShort())
+                packet[19] = 0
+                val idle = KnobProtocol.snapshot(packet).trainer!!
+                assertNull(idle.mode)
+                assertEquals(0, idle.modeWireValue)
+                assertTrue(idle.canChangeMode)
+                assertFalse(idle.copy(fresh = false).canChangeMode)
+                assertFalse(idle.copy(twinStatusKnown = false).canChangeMode)
+                assertFalse(idle.copy(fitnessMode = 5).canChangeMode)
+                assertFalse(idle.copy(modeChangeAllowed = false).canChangeMode)
+                packet[19] = 99
+                val unsupported = KnobProtocol.snapshot(packet).trainer!!
+                assertEquals(99, unsupported.modeWireValue)
+                assertFalse(unsupported.canChangeMode)
+            }
+        }
     }
 
     @Test

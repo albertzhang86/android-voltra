@@ -5,18 +5,43 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
 /** Explicit Twin UI demo through a knob. Never evidence of native hardware support. */
-class SimulatedKnobController(parentScope: CoroutineScope) : VoltraController {
+class SimulatedKnobController(
+    parentScope: CoroutineScope,
+    private val initialTrainers: List<VoltraDevice> = SimulatedVoltraController.devices,
+) : VoltraController {
+    init {
+        require(initialTrainers.isNotEmpty() && initialTrainers.size <= 2)
+        require(initialTrainers.distinct().size == initialTrainers.size)
+        require(initialTrainers.all { it in SimulatedVoltraController.devices })
+    }
+
     private val job = SupervisorJob(parentScope.coroutineContext[Job])
     private val scope = CoroutineScope(parentScope.coroutineContext + job)
     private val delegate = SimulatedVoltraController(scope)
+    private var topologyRevision = 0L
     override val state =
         delegate.state
             .map {
                 it.copy(
                     viaKnob = true,
+                    topologyRevision = ++topologyRevision,
                     knob =
                         if (it.trainers.isEmpty()) null
-                        else KnobState(DEVICE, ConnectionStatus.READY, 78),
+                        else
+                            KnobState(
+                                DEVICE,
+                                ConnectionStatus.READY,
+                                78,
+                                twinIdentityGuarded = true,
+                                twinCandidate =
+                                    if (it.twin == null && it.trainers.size == 1)
+                                        SimulatedVoltraController.devices.firstOrNull { candidate ->
+                                            it.trainers.none { trainer ->
+                                                trainer.device.id == candidate.id
+                                            }
+                                        }
+                                    else null,
+                            ),
                 )
             }
             .stateIn(scope, SharingStarted.Eagerly, VoltraState(viaKnob = true, isSimulated = true))
@@ -25,8 +50,7 @@ class SimulatedKnobController(parentScope: CoroutineScope) : VoltraController {
 
     override suspend fun connect(device: VoltraDevice) {
         require(device == DEVICE)
-        delegate.connect(SimulatedVoltraController.devices.first())
-        delegate.connect(SimulatedVoltraController.devices.last())
+        initialTrainers.forEach { delegate.connect(it) }
     }
 
     override fun disconnect(deviceId: String) {
@@ -46,10 +70,21 @@ class SimulatedKnobController(parentScope: CoroutineScope) : VoltraController {
     override suspend fun setParameter(deviceId: String, parameter: Parameter, value: Int) =
         delegate.setParameter(deviceId, parameter, value)
 
-    override suspend fun createTwin(controllerId: String, peerId: String) =
+    override suspend fun createTwin(controllerId: String, peerId: String) {
+        check(delegate.state.value.trainers.any { it.device.id == controllerId })
+        if (delegate.state.value.trainers.none { it.device.id == peerId }) {
+            val peer = requireNotNull(SimulatedVoltraController.devices.find { it.id == peerId })
+            delegate.connect(peer)
+        }
         delegate.createTwin(controllerId, peerId)
+    }
 
-    override suspend fun exitTwin() = delegate.exitTwin()
+    override suspend fun exitTwin() {
+        val peerId = delegate.state.value.twin?.peerId
+        delegate.exitTwin()
+        // A single-trainer knob follows its selected controller again after Twin ends.
+        if (initialTrainers.size == 1 && peerId != null) delegate.disconnect(peerId)
+    }
 
     override fun beginSet() = delegate.beginSet()
 

@@ -5,12 +5,15 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.content.Context
+import android.os.SystemClock
+import android.util.Log
 import io.github.albertzhang86.voltra.VoltraDevice
 import io.github.albertzhang86.voltra.VoltraLink
 import io.github.albertzhang86.voltra.VoltraTransport
 import io.github.albertzhang86.voltra.knob.KnobProtocol
 import java.util.UUID
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.onEach
 
 /** Discovers only the TV bridge service; ordinary trainer advertisements never match. */
 @SuppressLint("MissingPermission")
@@ -73,5 +76,43 @@ class AndroidKnobTransport(context: Context) : VoltraTransport {
 
     override fun scan(): Flow<List<VoltraDevice>> = transport.scan()
 
-    override suspend fun connect(device: VoltraDevice): VoltraLink = transport.connect(device)
+    override suspend fun connect(device: VoltraDevice): VoltraLink {
+        val link = transport.connect(device)
+        return object : VoltraLink {
+            private var lastSnapshotTraceAt = 0L
+
+            override val packets =
+                link.packets.onEach { frame ->
+                    if (Log.isLoggable(TRACE_TAG, Log.DEBUG)) {
+                        val now = SystemClock.elapsedRealtime()
+                        val snapshot = KnobProtocol.header(frame, KnobProtocol.SNAPSHOT)
+                        if (!snapshot || now - lastSnapshotTraceAt >= 1000) {
+                            trace("RX", frame)
+                            if (snapshot) lastSnapshotTraceAt = now
+                        }
+                    }
+                }
+
+            override suspend fun write(frame: ByteArray) {
+                trace("TX", frame)
+                link.write(frame)
+            }
+
+            override fun close() = link.close()
+        }
+    }
+
+    /** Opt-in local protocol diagnostics; disabled unless this Android log tag is enabled. */
+    private fun trace(direction: String, frame: ByteArray) {
+        if (Log.isLoggable(TRACE_TAG, Log.DEBUG)) {
+            Log.d(
+                TRACE_TAG,
+                "$direction ${frame.joinToString("") { "%02x".format(it.toInt() and 255) }}",
+            )
+        }
+    }
+
+    private companion object {
+        const val TRACE_TAG = "VoltraBridge"
+    }
 }

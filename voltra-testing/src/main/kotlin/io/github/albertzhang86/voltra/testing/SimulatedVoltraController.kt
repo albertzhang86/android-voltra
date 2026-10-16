@@ -71,7 +71,7 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
                                     },
                             )
                         }
-                    old.copy(trainers = trainers, twin = telemetry(old.twin, trainers))
+                    old.copy(trainers = trainers, twin = telemetry(old.twin, trainers, tick / 20))
                 }
             }
         }
@@ -156,6 +156,7 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
                             health = TwinHealth.DEGRADED,
                             activeWeightLb = null,
                             reps = null,
+                            deviceReps = null,
                             setWeightLb = null,
                         )
                     else it.twin,
@@ -248,7 +249,7 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
                             }
                     )
                 }
-                mutableState.update { it.copy(twin = telemetry(it.twin, it.trainers)) }
+                mutableState.update { it.copy(twin = telemetry(it.twin, it.trainers, tick / 20)) }
             } finally {
                 mutableState.update {
                     it.copy(trainers = it.trainers.map { s -> s.copy(pending = false) })
@@ -286,7 +287,7 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
                         },
                 )
             }
-            mutableState.update { it.copy(twin = telemetry(it.twin, it.trainers)) }
+            mutableState.update { it.copy(twin = telemetry(it.twin, it.trainers, tick / 20)) }
         } finally {
             mutableState.update { it.copy(twinPending = false) }
         }
@@ -369,7 +370,7 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
                             cableMoving = null,
                         )
                 }
-            old.copy(trainers = trainers, twin = telemetry(old.twin, trainers))
+            old.copy(trainers = trainers, twin = telemetry(old.twin, trainers, tick / 20))
         }
     }
 
@@ -380,7 +381,11 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
     }
 
     companion object {
-        private fun telemetry(pair: TwinPair?, trainers: List<TrainerState>): TwinPair? {
+        private fun telemetry(
+            pair: TwinPair?,
+            trainers: List<TrainerState>,
+            rawReps: Int,
+        ): TwinPair? {
             if (pair == null) return null
             val controller = trainers.find { it.device.id == pair.controllerId }
             val peer = trainers.find { it.device.id == pair.peerId }
@@ -395,12 +400,14 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
                     health = TwinHealth.DEGRADED,
                     activeWeightLb = null,
                     reps = null,
+                    deviceReps = null,
                     setWeightLb = null,
                 )
             return pair.copy(
                 activeWeightLb =
                     controller.activeWeightLb?.let { a -> peer.activeWeightLb?.let { a + it } },
                 reps = controller.reps,
+                deviceReps = rawReps,
                 setWeightLb =
                     if (controller.mode != peer.mode) null
                     else if (controller.mode == TrainingMode.BAND)

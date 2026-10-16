@@ -2,7 +2,7 @@
 
 UI-free Kotlin/JVM protocol and Android BLE connector for Beyond Power VOLTRA trainers.
 
-**Experimental.** The implementation is covered by protocol and simulated-transport tests; native discovery, two connections, Twin creation/exit and peer reconnection have been verified on a Google TV Streamer with two unloaded trainers. Live workout telemetry and loaded controls still need hardware validation. This is an independent community project, not an official Beyond Power SDK.
+**Experimental.** Protocol, controller and simulated-transport tests cover the implementation. Physical tests on October 16 verified mixed Twin creation/exit from the TV and knob, plus Weight Training live force and five reps through the knob on both displays. Direct-TV native Twin telemetry, other training modes, automatic workout transitions and recovery across real device failures still require hardware acceptance. This is an independent community project, not an official Beyond Power SDK.
 
 ## Modules
 
@@ -18,8 +18,9 @@ The direct connector supports up to two independent connections, battery, live c
 
 Treat each trainer as accepting one controlling client at a time. Disconnect
 Cortex, Beyond+ or the knob before connecting directly from Android. For the knob
-route, close Android's direct controller first; Android connects to the knob's
-bridge while the knob owns the trainer connection. Release the connection in the
+route, disconnect that specific trainer from Android first; Android connects to
+the knob's bridge while the knob owns the trainer connection. A different trainer
+may stay connected directly through `MixedVoltraController`. Release the connection in the
 previous client explicitly—closing its window may leave Bluetooth connected.
 An occupied connection can cause discovery/connection failures; a timeout alone
 does not prove this cause. Native Twin is reached through its verified controller,
@@ -43,13 +44,16 @@ endpoint identities. A paired controller exposes both trainers through one BLE
 connection. Exit confirms independent state, waits for the peer to advertise, then
 reconnects it; a missing peer is reported without replaying unpair.
 
-A Google TV Streamer pair/exit cycle passed with both trainers unloaded and in
-idle mode. Shared mode/settings commands are implemented but not physically
-validated under load. **Native Twin live force and reps remain unavailable**:
-no unclassified single-trainer reading is doubled or substituted into pair data.
-Knob v2 supports the same topology and commands. Physical TV/knob PIN pairing and
-authenticated bridge telemetry pass; native Twin over the bridge remains unverified.
-Knob pair/exit currently requires idle mode on both trainers.
+Shared mode/settings commands are implemented; successful unloaded topology checks
+do not validate every mode under load. Native Twin force and reps through the knob
+were physically verified in Weight Training on October 16: five reps and moving
+weight appeared on both the knob and TV. The firmware sums two explicit measured
+force channels from the same recognized packet; it never doubles one cable.
+Direct-TV native Twin telemetry remains unavailable pending classification and
+hardware validation. Mixed native creation/exit passed from both the TV and knob.
+Knob pairing accepts a fresh unloaded home or supported training screen, verifies
+both live endpoint identities and unloaded states, and enters idle before native
+pairing. It restores the controller's previous mode only after the pair is confirmed.
 
 The direct and knob demos implement Twin UI semantics only: shared settings in all
 four modes, two batteries, per-side force readings and a logical pair reading with
@@ -104,8 +108,10 @@ controller.close()
 scope.cancel()
 ```
 
-Use a long-lived owner scope when the app displays a workout overlay. A dead app process closes its connections; applications must reconnect explicitly and read back settings. This connector does not replay commands. The explicit Exit Twin flow is the only
-automatic reconnect path: it restores the now-independent peer.
+Use a long-lived owner scope when the app displays a workout overlay. A dead app process closes its connections; applications must reconnect explicitly and read back settings. This connector does not replay commands. Twin exit restores the now-independent
+peer. Mixed handoff can also restore the former direct peer after a confirmed
+failed creation or a separately observed local-knob exit; uncertain topology
+blocks restoration until fresh state proves that reconnecting is safe.
 
 Call `controller.forget(deviceId)` to reset an app connection: it disconnects,
 cancels pending settings/topology work and removes cached identity/readings. For a
@@ -120,8 +126,9 @@ forget its knob connection; relayed trainers are managed on the knob itself.
 - Parameter weights are integer **pounds**; eccentric is an added signed weight, not a percentage. Base plus eccentric must be 5–200 lb.
 - `activeWeightLb` is commanded resistance, independent of `setWeightLb` and measured cable tension. Fresh independent fitness state 4 produces zero with source `UNLOADED`. In loaded states 5/21, only a fresh device-reported target produces a value with source `TARGET_FORCE`; unknown state or missing/expired target produces null. Base weight is never substituted.
 - `resistanceTargetLb` preserves the fresh optional `0xb4` target. `measuredForceLb` separately carries the first B4 word or legacy `0xaa/0x81/0x2b` measured tension. `runtimeWireWeightLb` is the coarse `0x3e83` signed whole-pound measurement, read every 250 ms plus Bluetooth processing time. Residual measured tension can be nonzero while unloaded; neither measured source is active resistance. Direct readings expire after 1.5 seconds and clear on mode, load-state, or endpoint changes.
-- B4 independent sources 0/1/2 have verified protocol fields for measured force and optional target in tenths of pounds. Their mapping is known from the Cortex decoder and captured frames; correspondence of target resistance to the trainer's display during chains/eccentric motion still requires physical validation. No target is inferred for layouts without it. Native Twin readings remain withheld.
+- B4 independent sources 0/1/2 have verified protocol fields for measured force and optional target in tenths of pounds. Their mapping is known from the Cortex decoder and captured frames; correspondence of target resistance to the trainer's display during chains/eccentric motion still requires physical validation. No target is inferred for layouts without it. Direct-TV native Twin readings remain withheld; classified knob-bridge pair readings are exposed separately on `TwinPair`.
 - `cableMoving` classifies fresh loaded movement separately from resistance target. Direct connections use signed B4 velocity from the same sample as measured force: magnitude at least 10 mm/s is moving, less is stationary, and unknown/expired motion is null. The 10 mm/s deadband is display policy, not a vendor constant. Motion expires after 500 ms, resets with the force sample on mode/load/topology changes, and cannot be carried over to a legacy force-only sample. Bridge v2 bit 7 carries the knob's verified moving-force classification; older snapshots never imply movement. A display can show `measuredForceLb` only while `cableMoving == true`, otherwise show the mode's configured setting. Damper level and Isokinetic target speed are not weight values.
+- Native Twin through the knob exposes combined `TwinPair.measuredForceLb` only with confirmed `cableMoving`, raw logical counts as `deviceReps`, and app-set-relative counts as `reps`. Weight Training force and five reps were verified on both displays; other modes and automated workout transitions remain pending physical acceptance.
 - Mode/status and parameter freshness is checked separately. Stale state disables controls; after 10 seconds without status the connection fails. Unknown modes remain read-only.
 - Battery is decoded from its register or validated endpoint status, never guessed from packet length.
 - Speeds use mm/s. Isokinetic return speed `0` means Auto. Damper levels are zero-based; `Parameter.damperFactors` provides factors.
@@ -139,3 +146,45 @@ forget its knob connection; relayed trainers are managed on the knob itself.
 Tests cover malformed/fragmented frames, CRCs, units, battery decoding, independent command routing, readback timeouts, stale readings, rep deduplication and demo Twin behavior. Tests do not validate radio behavior or compatibility with every firmware. CI runs the same checks. For cloud-synced workspaces, `voltra.buildRoot` in local.properties can redirect generated files outside the checkout.
 
 Protocol attribution and pinned references: [THIRD_PARTY.md](THIRD_PARTY.md). License: [MIT](LICENSE).
+
+### Mixed direct and knob connections
+
+`MixedVoltraController(direct, knob, parentScope)` combines independent controllers
+into one `VoltraController`. `selectRoute(VoltraConnectionRoute.DIRECT/KNOB)` selects
+discovery and new connections without closing either owner. `state.routeFor(id)`
+identifies the transport for each trainer; mode, parameter, disconnect and forget
+operations follow that owner regardless of the discovery route. `currentState`
+and `state.value` reflect synchronous child changes before collectors resume.
+
+Up to two trainer identities are supported. Duplicate ownership (case-insensitive
+identity) and unexpected over-capacity from knob changes surface `connectionError`
+and block settings/Twin operations until resolved. Both inventories remain visible
+so the caller can offer disconnect actions. Switching discovery never changes
+physical ownership or creates a pair. An explicit mixed Create Twin action does
+transfer the direct peer to the knob through the guarded native handoff below.
+The UI should use per-trainer `routeFor`, not the aggregate `viaKnob` discovery
+flag, for unit fallback, control descriptions and disconnect actions.
+
+For mixed Twin, the knob-side trainer is always the native controller. The library
+releases the direct peer, advertises its exact identity through the trusted bridge,
+and requests native pairing only when the knob reports that exact authorized
+candidate. The knob can perform the peer's read-only handshake while TV radio
+coexistence keeps discovery paused; it never invents a recent advertisement.
+Fresh identity and unloaded readbacks from both trainers are required before mode
+or pairing writes. A successful pair is owned entirely by the knob, not emulated
+by sending settings to two independent connections.
+
+The optional `KnobTwinBridge` interface carries peer ownership/readiness offers,
+explicit knob-button requests and their completion status. Offers alone never
+pair. Busy or expired readiness disables Create while retaining the TV-owned peer
+in the knob's device list. Epoch/session-bound request IDs suppress duplicate
+notifications and reconnect replay. Pairing, exit and restoration are serialized;
+settings and lifecycle changes are blocked while topology is changing.
+
+A known failed handoff restores the former direct peer only after independent
+state is confirmed. After native pairing, either TV Exit or a later verified local
+knob Exit restores that same peer to the TV once. Changed controller identity,
+loaded/stale/unknown state and ambiguous pairing outcomes block this recovery.
+The app may choose a bounded retry policy after a safely restored failure; this
+library does not blindly resend an uncertain native command. See
+[the complete bridge extension](docs/knob-bridge.md#mixed-twin-offers-and-handoff).

@@ -9,21 +9,22 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class SimulatedVoltraControllerTest {
     @Test
-    fun `Twin band maximum is shared and total simulated force stays within that maximum`() = runTest {
-        val controller = SimulatedVoltraController(backgroundScope)
-        SimulatedVoltraController.devices.forEach { controller.connect(it) }
-        controller.createTwin("demo-left", "demo-right")
-        controller.setMode("demo-left", TrainingMode.BAND)
-        controller.setParameter("demo-left", Parameter.BAND_MAXIMUM, 40)
-        controller.beginSet()
-        advanceTimeBy(5_100)
-        runCurrent()
-        val state = controller.state.value
-        assertEquals(40, state.twin?.setWeightLb)
-        assertTrue(state.trainers.all { it.setWeightLb == 40 })
-        assertTrue(requireNotNull(state.twin?.activeWeightLb) in 0.0..40.0)
-        controller.close()
-    }
+    fun `Twin band maximum is shared and total simulated force stays within that maximum`() =
+        runTest {
+            val controller = SimulatedVoltraController(backgroundScope)
+            SimulatedVoltraController.devices.forEach { controller.connect(it) }
+            controller.createTwin("demo-left", "demo-right")
+            controller.setMode("demo-left", TrainingMode.BAND)
+            controller.setParameter("demo-left", Parameter.BAND_MAXIMUM, 40)
+            controller.beginSet()
+            advanceTimeBy(5_100)
+            runCurrent()
+            val state = controller.state.value
+            assertEquals(40, state.twin?.setWeightLb)
+            assertTrue(state.trainers.all { it.setWeightLb == 40 })
+            assertTrue(requireNotNull(state.twin?.activeWeightLb) in 0.0..40.0)
+            controller.close()
+        }
 
     @Test
     fun `finished demo sets become unloaded so the next exercise can enter and exit Twin`() =
@@ -91,6 +92,7 @@ class SimulatedVoltraControllerTest {
         assertEquals("demo-right", pair.controllerId)
         assertEquals(TwinHealth.READY, pair.health)
         assertEquals(1, pair.reps)
+        assertEquals(1, pair.deviceReps)
         assertTrue(controller.state.value.trainers.all { it.deviceReps == null })
         assertEquals(60, pair.setWeightLb)
         assertNotNull(pair.activeWeightLb)
@@ -98,6 +100,11 @@ class SimulatedVoltraControllerTest {
         assertFalse(controller.state.value.trainers.first().canEdit(Parameter.WEIGHT))
         controller.beginSet()
         assertEquals(0, controller.state.value.twin?.reps)
+        assertEquals(1, controller.state.value.twin?.deviceReps)
+        advanceTimeBy(5_100)
+        runCurrent()
+        assertEquals(1, controller.state.value.twin?.reps)
+        assertEquals(2, controller.state.value.twin?.deviceReps)
         controller.close()
     }
 
@@ -113,6 +120,7 @@ class SimulatedVoltraControllerTest {
         assertEquals(TwinHealth.DEGRADED, state.twin?.health)
         assertNull(state.twin?.activeWeightLb)
         assertNull(state.twin?.reps)
+        assertNull(state.twin?.deviceReps)
         assertTrue(state.trainers.all { it.deviceReps == null })
         assertFalse(state.canCreateTwin)
         assertFalse(state.canExitTwin)

@@ -76,6 +76,12 @@ enum class ConnectionStatus {
     FAILED,
 }
 
+/** The link that owns a trainer, independent of the route currently selected for discovery. */
+enum class VoltraConnectionRoute {
+    DIRECT,
+    KNOB,
+}
+
 enum class TwinRole {
     CONTROLLER,
     PEER,
@@ -129,6 +135,8 @@ data class TrainerState(
     val cableMoving: Boolean? = null,
     /** Confirmed trainer count, never rebased by app beginSet; null when unavailable or stale. */
     val deviceReps: Int? = null,
+    /** Device-reported mode register; zero is idle, distinct from an unsupported or unread mode. */
+    val modeWireValue: Int? = null,
 ) {
     val connected
         get() = status == ConnectionStatus.READY
@@ -162,7 +170,7 @@ data class TrainerState(
 
     val canChangeMode
         get() =
-            (mode != null || fitnessMode == 0) &&
+            (mode != null || modeWireValue == 0) &&
                 modeChangeAllowed &&
                 connected &&
                 fresh &&
@@ -181,9 +189,17 @@ data class TwinPair(
     val activeWeightLb: Double? = null,
     val reps: Int? = null,
     val setWeightLb: Int? = null,
+    /**
+     * Verified logical pair force; never copied to either physical member or inferred from weight.
+     */
+    val measuredForceLb: Double? = null,
+    /** True only while the same classified pair force sample confirms loaded cable movement. */
+    val cableMoving: Boolean? = null,
+    /** Native logical pair count, independent of the app set's [reps] baseline. */
+    val deviceReps: Int? = null,
 ) {
     init {
-        require(controllerId != peerId)
+        require(!controllerId.equals(peerId, true))
     }
 }
 
@@ -197,14 +213,36 @@ data class VoltraState(
     val viaKnob: Boolean = false,
     /** Monotonic within a controller when device telemetry continuity resets; not app beginSet. */
     val telemetryEpoch: Long = 0,
+    /** Owning route for each trainer; a knob's unconnected Twin candidate may also be included. */
+    val trainerRoutes: Map<String, VoltraConnectionRoute> = emptyMap(),
+    /** A topology conflict that must be resolved before settings or Twin commands are allowed. */
+    val connectionError: String? = null,
+    /**
+     * Increases for each received topology snapshot; permits confirmation after a command fails.
+     */
+    val topologyRevision: Long = 0,
 ) {
+    fun routeFor(deviceId: String): VoltraConnectionRoute =
+        trainerRoutes.entries.firstOrNull { it.key.equals(deviceId, ignoreCase = true) }?.value
+            ?: if (viaKnob) VoltraConnectionRoute.KNOB else VoltraConnectionRoute.DIRECT
+
+    val hasMixedConnections: Boolean
+        get() = trainers.map { routeFor(it.device.id) }.distinct().size > 1
+
     val canCreateTwin: Boolean
         get() =
-            twinSupported &&
+            connectionError == null &&
+                twinSupported &&
                 twin == null &&
                 !twinPending &&
-                ((trainers.size == 2 && trainers.map { it.device.id }.distinct().size == 2) ||
-                    (viaKnob && trainers.size == 1 && knob?.twinCandidate != null)) &&
+                ((trainers.size == 2 &&
+                    !trainers[0].device.id.equals(trainers[1].device.id, ignoreCase = true)) ||
+                    (trainers.size == 1 &&
+                        routeFor(trainers.single().device.id) == VoltraConnectionRoute.KNOB &&
+                        knob?.twinCandidate?.let {
+                            routeFor(it.id) == VoltraConnectionRoute.KNOB &&
+                                !it.id.equals(trainers.single().device.id, ignoreCase = true)
+                        } == true)) &&
                 trainers.all {
                     it.connected &&
                         it.fresh &&
@@ -216,9 +254,13 @@ data class VoltraState(
 
     val canExitTwin: Boolean
         get() =
-            twinSupported &&
+            connectionError == null &&
+                twinSupported &&
                 twin?.health == TwinHealth.READY &&
-                (!viaKnob || isSimulated || knob?.twinExitAllowed == true) &&
+                !hasMixedConnections &&
+                (routeFor(twin.controllerId) != VoltraConnectionRoute.KNOB ||
+                    isSimulated ||
+                    knob?.twinExitAllowed == true) &&
                 !twinPending &&
                 trainers.size == 2 &&
                 trainers.map { it.device.id }.toSet() == setOf(twin.controllerId, twin.peerId) &&
@@ -246,4 +288,8 @@ data class KnobState(
     val twinExitAllowed: Boolean = false,
     /** USB-host power detected; not proof of battery charging or charge completion. */
     val usbPowerConnected: Boolean = false,
+    /** Firmware verifies the requested peer identity both at admission and execution. */
+    val twinIdentityGuarded: Boolean = false,
+    /** Trusted TV peer offers and explicit requests initiated by the knob are supported. */
+    val mixedTwinHandoffSupported: Boolean = false,
 )

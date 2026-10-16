@@ -565,14 +565,113 @@ class DirectVoltraControllerTest {
     }
 
     @Test
-    fun `unsupported mode remains connected read only`() = runTest {
-        val rig = Rig(this)
-        rig.link().values[VoltraProtocol.MODE] = 99
-        rig.ready()
-        assertEquals(ConnectionStatus.READY, rig.trainer().status)
-        assertNull(rig.trainer().mode)
-        assertFalse(rig.trainer().canChangeMode)
-        rig.controller.close()
+    fun `idle trainer can select a mode independently of a connected weight trainer`() = runTest {
+        for (fitness in listOf(0, 4)) {
+            val rig = Rig(this)
+            rig.link().values[VoltraProtocol.MODE] = 0
+            rig.link().values[VoltraProtocol.FITNESS] = fitness
+            rig.ready(2)
+            assertNull(rig.trainer().mode)
+            assertEquals(0, rig.trainer().modeWireValue)
+            assertTrue(rig.trainer().parameters.isEmpty())
+            assertTrue(rig.trainer().canChangeMode)
+            assertEquals(TrainingMode.WEIGHT, rig.trainer("right").mode)
+            assertTrue(rig.trainer("right").canChangeMode)
+
+            val selection = async { rig.controller.setMode("left", TrainingMode.BAND) }
+            advanceTimeBy(250)
+            runCurrent()
+            selection.await()
+            assertEquals(TrainingMode.BAND, rig.trainer().mode)
+            assertEquals(TrainingMode.BAND.wireValue, rig.trainer().modeWireValue)
+            assertFalse(rig.trainer().pending)
+            assertEquals(TrainingMode.WEIGHT, rig.trainer("right").mode)
+            assertTrue(
+                rig.link("right").writes.none {
+                    it.command == 0x11 && it.register == VoltraProtocol.MODE
+                }
+            )
+            rig.controller.close()
+        }
+    }
+
+    @Test
+    fun `unsupported mode remains read only even with idle fitness status`() = runTest {
+        for (fitness in listOf(0, 4)) {
+            val rig = Rig(this)
+            rig.link().values[VoltraProtocol.MODE] = 99
+            rig.link().values[VoltraProtocol.FITNESS] = fitness
+            rig.ready()
+            assertEquals(ConnectionStatus.READY, rig.trainer().status)
+            assertNull(rig.trainer().mode)
+            assertEquals(99, rig.trainer().modeWireValue)
+            assertFalse(rig.trainer().canChangeMode)
+            assertTrue(runCatching { rig.controller.setMode("left", TrainingMode.BAND) }.isFailure)
+            assertTrue(
+                rig.link().writes.none { it.command == 0x11 && it.register == VoltraProtocol.MODE }
+            )
+            rig.controller.close()
+        }
+    }
+
+    @Test
+    fun `idle mode cannot bypass loaded or armed fitness status`() = runTest {
+        for (fitness in listOf(5, 21, 0x26, 0x27)) {
+            val rig = Rig(this)
+            rig.link().values[VoltraProtocol.MODE] = 0
+            rig.link().values[VoltraProtocol.FITNESS] = fitness
+            rig.ready()
+            assertEquals(0, rig.trainer().modeWireValue)
+            assertFalse(rig.trainer().canChangeMode)
+            assertTrue(runCatching { rig.controller.setMode("left", TrainingMode.BAND) }.isFailure)
+            assertTrue(
+                rig.link().writes.none { it.command == 0x11 && it.register == VoltraProtocol.MODE }
+            )
+            rig.controller.close()
+        }
+    }
+
+    @Test
+    fun `idle mode needs both mode readback and known topology`() = runTest {
+        for (missingMode in listOf(false, true)) {
+            val rig = Rig(this)
+            rig.link().values[VoltraProtocol.FITNESS] = 0
+            if (missingMode) rig.link().values.remove(VoltraProtocol.MODE)
+            else {
+                rig.link().values[VoltraProtocol.MODE] = 0
+                rig.link().respondEndpoint = false
+            }
+            rig.ready()
+            if (missingMode) assertNull(rig.trainer().modeWireValue)
+            else assertFalse(rig.trainer().twinStatusKnown)
+            assertFalse(rig.trainer().canChangeMode)
+            assertTrue(runCatching { rig.controller.setMode("left", TrainingMode.BAND) }.isFailure)
+            assertTrue(
+                rig.link().writes.none { it.command == 0x11 && it.register == VoltraProtocol.MODE }
+            )
+            rig.controller.close()
+        }
+    }
+
+    @Test
+    fun `idle mode needs fresh fitness mode and topology readback`() = runTest {
+        for (staleRegister in listOf(VoltraProtocol.MODE, VoltraProtocol.FITNESS, null)) {
+            val rig = Rig(this)
+            rig.link().values[VoltraProtocol.MODE] = 0
+            rig.ready()
+            assertTrue(rig.trainer().canChangeMode)
+            if (staleRegister == null) rig.link().respondEndpoint = false
+            else rig.link().values.remove(staleRegister)
+            advanceTimeBy(4_000)
+            runCurrent()
+            assertEquals(0, rig.trainer().modeWireValue)
+            assertFalse(rig.trainer().canChangeMode)
+            assertTrue(runCatching { rig.controller.setMode("left", TrainingMode.BAND) }.isFailure)
+            assertTrue(
+                rig.link().writes.none { it.command == 0x11 && it.register == VoltraProtocol.MODE }
+            )
+            rig.controller.close()
+        }
     }
 
     @Test

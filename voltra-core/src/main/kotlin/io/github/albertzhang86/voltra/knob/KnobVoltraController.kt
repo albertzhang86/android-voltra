@@ -14,14 +14,20 @@ class KnobVoltraController(
     rememberedDevice: VoltraDevice? = null,
     private val onConnected: (VoltraDevice) -> Unit = {},
     private val onForgotten: (String) -> Unit = {},
-) : VoltraController {
+) : VoltraController, KnobTwinBridge {
     private val job = SupervisorJob(parentScope.coroutineContext[Job])
     private val scope = CoroutineScope(parentScope.coroutineContext + job)
     private var rememberedDevice = rememberedDevice
     private var telemetryEpoch = 0L
+    private var topologyRevision = 0L
     private val mutableState = MutableStateFlow(disconnectedState())
     override val state = mutableState.asStateFlow()
     private val commands = Mutex()
+    private val writes = Mutex()
+    private val offers = Mutex()
+    private var lastOfferDeadline: Int? = null
+    private var lastOfferEpoch: Int? = null
+    private var lastOfferSession: Int? = null
     private val commandJobs = mutableSetOf<Job>()
     private var link: VoltraLink? = null
     private var connection: Job? = null
@@ -32,8 +38,16 @@ class KnobVoltraController(
     private var baseline: Int? = null
     private var waitingForFirstRep = false
     private var repTrainerId: String? = null
+    private var repSource: RepSource? = null
+
+    private data class RepSource(val controllerId: String, val peerId: String?, val modeWire: Int?)
+
     private var pending: Pending? = null
     private var generation = 0
+    private var lastTwinRequest: KnobTwinRequest? = null
+    private var peerOfferSent = false
+    private val mutableTwinRequests = MutableSharedFlow<KnobTwinRequest>(extraBufferCapacity = 8)
+    override val twinRequests = mutableTwinRequests.asSharedFlow()
 
     private data class Pending(
         val epoch: Int,
@@ -46,9 +60,12 @@ class KnobVoltraController(
         scope.launch {
             while (isActive) {
                 delay(250)
-                if (snapshot != null && now() - receivedAt > 500) {
+                if (snapshot != null && now() - receivedAt >= 500) {
                     mutableState.update { state ->
-                        state.copy(trainers = state.trainers.map { it.copy(cableMoving = null) })
+                        state.copy(
+                            trainers = state.trainers.map { it.copy(cableMoving = null) },
+                            twin = state.twin?.copy(measuredForceLb = null, cableMoving = null),
+                        )
                     }
                 }
                 if (snapshot != null && now() - receivedAt > 2000) {
@@ -58,6 +75,9 @@ class KnobVoltraController(
                                 it.twin?.copy(
                                     health = TwinHealth.DEGRADED,
                                     activeWeightLb = null,
+                                    measuredForceLb = null,
+                                    cableMoving = null,
+                                    deviceReps = null,
                                     reps = null,
                                 ),
                             knob =
@@ -133,6 +153,24 @@ class KnobVoltraController(
                     connected.packets.collect { bytes ->
                         if (generation != token) return@collect
                         when {
+                            KnobProtocol.header(bytes, KnobProtocol.TWIN_REQUEST) -> {
+                                val request = KnobProtocol.twinRequest(bytes)
+                                val current = snapshot
+                                val last = lastTwinRequest
+                                if (
+                                    current?.mixedTwinHandoffSupported == true &&
+                                        now() - receivedAt <= 2000 &&
+                                        request.epoch == current.epoch &&
+                                        request.session == current.session &&
+                                        (last == null ||
+                                            last.epoch != request.epoch ||
+                                            last.session != request.session ||
+                                            request.id > last.id)
+                                ) {
+                                    lastTwinRequest = request
+                                    mutableTwinRequests.tryEmit(request)
+                                }
+                            }
                             KnobProtocol.header(bytes, KnobProtocol.SNAPSHOT) -> {
                                 val firstReading = snapshot == null
                                 receive(KnobProtocol.snapshot(bytes))
@@ -204,6 +242,7 @@ class KnobVoltraController(
         baseline = null
         waitingForFirstRep = false
         repTrainerId = null
+        repSource = null
         mutableState.update {
             it.copy(
                 trainers = emptyList(),
@@ -231,19 +270,41 @@ class KnobVoltraController(
             old != null &&
                 (update.epoch != old.epoch ||
                     update.session != old.session ||
-                    (trainerId != null && repTrainerId != null && trainerId != repTrainerId))
+                    (trainerId != null &&
+                        repTrainerId != null &&
+                        !trainerId.equals(repTrainerId, true)))
         ) {
             telemetryEpoch++
             baseline = null
             waitingForFirstRep = false
             repTrainerId = null
+            repSource = null
+        }
+        // Unknown/temporarily absent snapshots must not erase an explicit set baseline.
+        // Compare the last known logical source, including both native pair identities.
+        val nextRepSource =
+            update.trainer
+                ?.takeIf { it.twinStatusKnown && (!it.twinReported || update.peer != null) }
+                ?.let {
+                    RepSource(
+                        it.device.id.lowercase(),
+                        update.peer?.id?.lowercase().takeIf { _ -> it.twinReported },
+                        it.modeWireValue.takeIf { _ -> it.twinReported },
+                    )
+                }
+        if (nextRepSource != null) {
+            if (repSource != null && repSource != nextRepSource) {
+                baseline = null
+                waitingForFirstRep = false
+            }
+            repSource = nextRepSource
         }
         if (trainerId != null) repTrainerId = trainerId
         if (
             old == null ||
                 update.epoch != old.epoch ||
                 update.session != old.session ||
-                update.trainer?.device?.id != old.trainer?.device?.id
+                !update.trainer?.device?.id.equals(old.trainer?.device?.id, true)
         ) {
             pending
                 ?.completion
@@ -256,22 +317,27 @@ class KnobVoltraController(
         snapshot = update
         snapshots.value = update
         receivedAt = now()
+        val raw =
+            if (update.trainer?.twinReported == true) update.twinDeviceReps
+            else
+                update.trainer?.deviceReps.takeIf {
+                    update.trainer?.connected == true && update.trainer.fresh
+                }
+        if (raw != null) {
+            if (waitingForFirstRep) {
+                // The first available pull after beginSet is one, even with no initial baseline.
+                baseline = (raw - 1).coerceAtLeast(0)
+                waitingForFirstRep = false
+            } else if (baseline != null && raw < requireNotNull(baseline)) {
+                baseline = 0
+            }
+        }
+        val relativeReps = raw?.let { (it - (baseline ?: 0)).coerceAtLeast(0) }
         val trainer =
             update.trainer?.let { trainer ->
-                val raw = trainer.deviceReps.takeIf { trainer.connected && trainer.fresh }
-                if (raw != null) {
-                    if (waitingForFirstRep) {
-                        // An explicitly started set without a reading must include its first rep.
-                        baseline = (raw - 1).coerceAtLeast(0)
-                        waitingForFirstRep = false
-                    } else if (baseline != null && raw < requireNotNull(baseline)) {
-                        // The trainer reset its counter; mirror the new count from zero.
-                        baseline = 0
-                    }
-                }
                 trainer.copy(
-                    reps = raw?.let { (it - (baseline ?: 0)).coerceAtLeast(0) },
-                    deviceReps = raw,
+                    reps = relativeReps.takeUnless { trainer.twinReported },
+                    deviceReps = raw.takeUnless { trainer.twinReported },
                     pending = trainer.pending || pending != null,
                 )
             }
@@ -303,12 +369,18 @@ class KnobVoltraController(
                     peer.device.id,
                     if (trainer.connected && trainer.fresh && trainer.twinVerified) TwinHealth.READY
                     else TwinHealth.DEGRADED,
+                    reps = relativeReps.takeUnless { trainer.pending },
+                    measuredForceLb = update.twinMeasuredForceLb.takeUnless { trainer.pending },
+                    cableMoving =
+                        true.takeIf { update.twinMeasuredForceLb != null && !trainer.pending },
+                    deviceReps = raw.takeUnless { trainer.pending },
                 )
             else null
         mutableState.update {
             it.copy(
                 twin = pair,
                 twinSupported = update.version == 2,
+                topologyRevision = ++topologyRevision,
                 telemetryEpoch = telemetryEpoch,
                 trainers = listOfNotNull(trainer, peer),
                 knob =
@@ -318,6 +390,8 @@ class KnobVoltraController(
                         usbPowerConnected = update.knobUsbPowerConnected,
                         twinCandidate = update.peer.takeIf { update.canCreateTwin },
                         twinExitAllowed = update.canExitTwin,
+                        twinIdentityGuarded = update.twinIdentityGuarded,
+                        mixedTwinHandoffSupported = update.mixedTwinHandoffSupported,
                         error = null,
                     ),
             )
@@ -326,8 +400,8 @@ class KnobVoltraController(
 
     override fun disconnect(deviceId: String) {
         if (
-            state.value.knob?.device?.id != deviceId &&
-                state.value.trainers.none { it.device.id == deviceId }
+            !state.value.knob?.device?.id.equals(deviceId, true) &&
+                state.value.trainers.none { it.device.id.equals(deviceId, true) }
         )
             return
         ++generation
@@ -344,7 +418,12 @@ class KnobVoltraController(
         baseline = null
         waitingForFirstRep = false
         repTrainerId = null
+        repSource = null
         nextId = 1
+        peerOfferSent = false
+        lastOfferDeadline = null
+        lastOfferEpoch = null
+        lastOfferSession = null
         mutableState.value = disconnectedState()
     }
 
@@ -356,10 +435,10 @@ class KnobVoltraController(
         )
 
     override fun forget(deviceId: String) {
-        require(state.value.trainers.none { it.device.id == deviceId }) {
+        require(state.value.trainers.none { it.device.id.equals(deviceId, true) }) {
             "Manage trainers on the knob. Only the knob connection can be forgotten from the TV."
         }
-        if (rememberedDevice?.id == deviceId) rememberedDevice = null
+        if (rememberedDevice?.id.equals(deviceId, true)) rememberedDevice = null
         disconnect(deviceId)
         // Invalidate the connection before persistence is cleared. Late snapshots carry the
         // old generation and cannot save this device again.
@@ -381,7 +460,7 @@ class KnobVoltraController(
         check(job.isActive)
         val current = requireNotNull(snapshot) { "Connect the knob first." }
         val trainer =
-            state.value.trainers.singleOrNull { it.device.id == deviceId }
+            state.value.trainers.singleOrNull { it.device.id.equals(deviceId, true) }
                 ?: error("Select the knob's active trainer.")
         check(now() - receivedAt <= 2000 && trainer.fresh) { "Wait for fresh knob readings." }
         check(
@@ -396,8 +475,7 @@ class KnobVoltraController(
             it.copy(trainers = it.trainers.map { trainer -> trainer.copy(pending = true) })
         }
         try {
-            requireNotNull(link)
-                .write(KnobProtocol.command(current, request.id, mode, parameter, value))
+            write(KnobProtocol.command(current, request.id, mode, parameter, value))
             withTimeout(5000) {
                 request.completion.await()
                 snapshots.first { observed ->
@@ -429,6 +507,49 @@ class KnobVoltraController(
 
     override suspend fun exitTwin() = changeTwin(false)
 
+    override suspend fun offerTwinPeer(peer: VoltraDevice?, ready: Boolean) =
+        offers.withLock {
+            // ID zero is reserved for expiring ownership/readiness announcements. It neither
+            // consumes
+            // motor-command IDs nor waits for a long-running native Twin command to finish.
+            val current = snapshot ?: return@withLock
+            val age = now() - receivedAt
+            if (!current.mixedTwinHandoffSupported || age !in 0..2000 || !job.isActive)
+                return@withLock
+            if (peer == null && !peerOfferSent) return@withLock
+            var deadline = current.uptime + age.toInt() + 1500
+            if (lastOfferEpoch == current.epoch && lastOfferSession == current.session) {
+                lastOfferDeadline?.let { if (deadline - it <= 0) deadline = it + 1 }
+            }
+            // Leave 500 ms headroom for immediate revoke/refresh calls without extending a stale
+            // snapshot indefinitely. Firmware independently rejects >2-second or replayed
+            // deadlines.
+            if (deadline - (current.uptime + age.toInt()) > 2000) return@withLock
+            write(KnobProtocol.twinPeerOffer(current, peer, ready, deadline))
+            lastOfferDeadline = deadline
+            lastOfferEpoch = current.epoch
+            lastOfferSession = current.session
+            peerOfferSent = peer != null
+        }
+
+    override suspend fun reportTwinRequest(
+        request: KnobTwinRequest,
+        status: KnobTwinRequestStatus,
+    ) =
+        commands.withLock {
+            val current = snapshot ?: return@withLock
+            if (
+                !current.mixedTwinHandoffSupported ||
+                    request.epoch != current.epoch ||
+                    request.session != current.session ||
+                    now() - receivedAt > 2000 ||
+                    !job.isActive
+            )
+                return@withLock
+            check(nextId <= 65535) { "Reconnect the knob before sending more changes." }
+            write(KnobProtocol.twinRequestStatus(current, nextId++, request, status))
+        }
+
     private suspend fun changeTwin(
         create: Boolean,
         controllerId: String? = null,
@@ -436,7 +557,10 @@ class KnobVoltraController(
     ) = connectionCommand {
         val current = requireNotNull(snapshot) { "Connect the knob first." }
         if (create)
-            require(current.trainer?.device?.id == controllerId && current.peer?.id == peerId) {
+            require(
+                current.trainer?.device?.id.equals(controllerId, true) &&
+                    current.peer?.id.equals(peerId, true)
+            ) {
                 "The knob's selected trainers changed. Check the current pair before retrying."
             }
         check(job.isActive && now() - receivedAt <= 2000)
@@ -451,7 +575,7 @@ class KnobVoltraController(
         pending = request
         mutableState.update { it.copy(twinPending = true) }
         try {
-            requireNotNull(link).write(KnobProtocol.twinCommand(current, request.id, create))
+            write(KnobProtocol.twinCommand(current, request.id, create))
             withTimeout(45_000) {
                 request.completion.await()
                 snapshots.first { update ->
@@ -462,7 +586,8 @@ class KnobVoltraController(
                         update.trainer.twinStatusKnown &&
                         !update.trainer.pending &&
                         (if (create)
-                            update.trainer.twinVerified && update.peer?.id == current.peer?.id
+                            update.trainer.twinVerified &&
+                                update.peer?.id.equals(current.peer?.id, true)
                         else !update.trainer.twinReported)
                 }
                 Unit
@@ -481,6 +606,15 @@ class KnobVoltraController(
         }
     }
 
+    private suspend fun write(frame: ByteArray) {
+        val active = requireNotNull(link)
+        val token = generation
+        writes.withLock {
+            check(token == generation) { "Knob connection changed." }
+            active.write(frame)
+        }
+    }
+
     private suspend fun <T> connectionCommand(block: suspend () -> T): T = coroutineScope {
         val token = generation
         val operation = currentCoroutineContext().job
@@ -496,22 +630,30 @@ class KnobVoltraController(
     }
 
     override fun beginSet() {
+        val current = snapshot
         val freshTrainer =
-            snapshot?.trainer?.takeIf { it.connected && it.fresh && now() - receivedAt <= 2000 }
-        baseline = freshTrainer?.deviceReps ?: 0
-        waitingForFirstRep = freshTrainer?.deviceReps == null
+            current?.trainer?.takeIf {
+                it.connected && it.fresh && !it.pending && now() - receivedAt <= 2000
+            }
+        val raw =
+            if (freshTrainer?.twinReported == true) current?.twinDeviceReps
+            else freshTrainer?.deviceReps
+        baseline = raw ?: 0
+        waitingForFirstRep = raw == null
         mutableState.update {
             it.copy(
+                twin = it.twin?.copy(reps = raw?.let { 0 }),
                 trainers =
                     it.trainers.map { trainer ->
                         trainer.copy(
                             reps =
-                                freshTrainer
-                                    ?.deviceReps
-                                    ?.let { 0 }
-                                    .takeIf { trainer.device.id == freshTrainer?.device?.id }
+                                raw?.let { 0 }
+                                    .takeIf {
+                                        !trainer.twinReported &&
+                                            trainer.device.id.equals(freshTrainer?.device?.id, true)
+                                    }
                         )
-                    }
+                    },
             )
         }
     }

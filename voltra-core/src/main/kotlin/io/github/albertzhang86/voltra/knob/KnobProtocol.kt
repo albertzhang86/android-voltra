@@ -18,6 +18,9 @@ object KnobProtocol {
     const val RESULT = 4
     const val CREATE_TWIN = 5
     const val EXIT_TWIN = 6
+    const val TWIN_PEER_OFFER = 7
+    const val TWIN_REQUEST = 8
+    const val TWIN_REQUEST_STATUS = 9
 
     data class Snapshot(
         val epoch: Int,
@@ -34,6 +37,11 @@ object KnobProtocol {
         val canCreateTwin: Boolean = false,
         val canExitTwin: Boolean = false,
         val knobUsbPowerConnected: Boolean = false,
+        val twinIdentityGuarded: Boolean = false,
+        val mixedTwinHandoffSupported: Boolean = false,
+        val twinPeerHandoff: Boolean = false,
+        val twinMeasuredForceLb: Double? = null,
+        val twinDeviceReps: Int? = null,
     )
 
     data class Result(val epoch: Int, val session: Int, val id: Int, val code: Int)
@@ -97,7 +105,8 @@ object KnobProtocol {
                 require(address.matches(Regex("[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}")))
                 val force = b.getInt(22)
                 require(force == -1 || force in 0..10000)
-                val mode = TrainingMode.fromWire(bytes[19].toInt() and 255)
+                val modeWireValue = bytes[19].toInt() and 255
+                val mode = TrainingMode.fromWire(modeWireValue)
                 val fitnessMode = (b.getShort(20).toInt() and 65535).takeUnless { it == 65535 }
                 val sourceFlags = if (version == 2) bytes[133].toInt() and 255 else 0
                 val isTarget = sourceFlags and 0x40 != 0
@@ -125,6 +134,7 @@ object KnobProtocol {
                         if (flags and 1 != 0) ConnectionStatus.READY
                         else ConnectionStatus.CONNECTING,
                     mode = mode,
+                    modeWireValue = modeWireValue,
                     parameters = values,
                     batteryPercent = battery(18),
                     activeWeightLb = activeWeight,
@@ -157,6 +167,29 @@ object KnobProtocol {
                         } else null,
                 )
             }
+        // v2 already carries classified force/count fields and both native identities. Older
+        // readers safely ignore them while paired. Keep logical pair telemetry out of physical
+        // TrainerState sensors; only the firmware may classify a native combined measurement.
+        val pairReady =
+            paired &&
+                trainer?.let {
+                    it.connected &&
+                        it.fresh &&
+                        it.twinVerified &&
+                        !it.pending &&
+                        it.mode != null &&
+                        it.fitnessMode in listOf(4, 5, 21)
+                } == true
+        val pairForce =
+            b.getInt(22)
+                .takeIf {
+                    pairReady &&
+                        it >= 0 &&
+                        bytes[133].toInt() and 0x80 != 0 &&
+                        trainer?.fitnessMode in listOf(5, 21)
+                }
+                ?.div(10.0)
+        val pairReps = (b.getShort(26).toInt() and 65535).takeIf { pairReady && it != 65535 }
         return Snapshot(
             b.getInt(4),
             b.getInt(8),
@@ -172,6 +205,11 @@ object KnobProtocol {
             version == 2 && bytes[133].toInt() and 1 != 0 && peer != null && !paired,
             version == 2 && bytes[133].toInt() and 2 != 0 && verified,
             version == 2 && bytes[133].toInt() and 0x20 != 0,
+            version == 2 && flags and 0x20 != 0,
+            version == 2 && flags and 0x40 != 0,
+            version == 2 && flags and 0x80 != 0,
+            pairForce,
+            pairReps,
         )
     }
 
@@ -204,19 +242,29 @@ object KnobProtocol {
     fun twinCommand(snapshot: Snapshot, id: Int, create: Boolean): ByteArray {
         require(snapshot.version == 2 && id in 1..65535)
         require(if (create) snapshot.canCreateTwin else snapshot.canExitTwin)
+        require(
+            !snapshot.twinPeerHandoff ||
+                (snapshot.twinIdentityGuarded && snapshot.mixedTwinHandoffSupported)
+        )
         return ByteBuffer.allocate(24)
             .order(ByteOrder.LITTLE_ENDIAN)
             .apply {
                 put(MAGIC.toByte())
                 put(VERSION.toByte())
                 put((if (create) CREATE_TWIN else EXIT_TWIN).toByte())
-                put(0)
+                put((if (create && snapshot.twinPeerHandoff) 1 else 0).toByte())
                 putInt(snapshot.epoch)
                 putInt(snapshot.session)
                 putInt(snapshot.uptime + 2000)
                 putShort(id.toShort())
-                putShort(0)
-                putInt(0)
+                if (create && snapshot.twinIdentityGuarded) {
+                    val address = requireNotNull(snapshot.peer).id.split(':')
+                    require(address.size == 6 && address.all { it.length == 2 })
+                    address.forEach { put(it.toInt(16).toByte()) }
+                } else {
+                    putShort(0)
+                    putInt(0)
+                }
             }
             .array()
     }
@@ -227,6 +275,64 @@ object KnobProtocol {
         val code = bytes[3].toInt() and 255
         require(code in 0..3)
         return Result(b.getInt(4), b.getInt(8), b.getShort(12).toInt() and 65535, code)
+    }
+
+    fun twinRequest(bytes: ByteArray): KnobTwinRequest {
+        require(bytes.size == 20 && header(bytes, TWIN_REQUEST) && bytes[3] == 0.toByte())
+        val b = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        val id = b.getShort(12).toInt() and 65535
+        require(id != 0 && bytes.copyOfRange(14, 20).any { it != 0.toByte() })
+        val peer = bytes.copyOfRange(14, 20).joinToString(":") { "%02X".format(it.toInt() and 255) }
+        return KnobTwinRequest(b.getInt(4), b.getInt(8), id, peer)
+    }
+
+    fun twinPeerOffer(
+        snapshot: Snapshot,
+        peer: VoltraDevice?,
+        ready: Boolean = true,
+        deadline: Int = snapshot.uptime + 1500,
+    ): ByteArray =
+        bridgeCommand(snapshot, 0, TWIN_PEER_OFFER).apply {
+            this[3] = (if (peer != null && ready) 1 else 0).toByte()
+            ByteBuffer.wrap(this).order(ByteOrder.LITTLE_ENDIAN).putInt(12, deadline)
+            peer
+                ?.id
+                ?.split(':')
+                ?.also { require(it.size == 6 && it.all { part -> part.length == 2 }) }
+                ?.forEachIndexed { index, part -> this[18 + index] = part.toInt(16).toByte() }
+        }
+
+    fun twinRequestStatus(
+        snapshot: Snapshot,
+        id: Int,
+        request: KnobTwinRequest,
+        status: KnobTwinRequestStatus,
+    ): ByteArray =
+        bridgeCommand(snapshot, id, TWIN_REQUEST_STATUS).also {
+            ByteBuffer.wrap(it)
+                .order(ByteOrder.LITTLE_ENDIAN)
+                .putShort(18, status.wireValue.toShort())
+                .putInt(20, request.id)
+        }
+
+    private fun bridgeCommand(snapshot: Snapshot, id: Int, type: Int): ByteArray {
+        require(snapshot.mixedTwinHandoffSupported)
+        require(if (type == TWIN_PEER_OFFER) id == 0 else id in 1..65535)
+        return ByteBuffer.allocate(24)
+            .order(ByteOrder.LITTLE_ENDIAN)
+            .apply {
+                put(MAGIC.toByte())
+                put(VERSION.toByte())
+                put(type.toByte())
+                put(0)
+                putInt(snapshot.epoch)
+                putInt(snapshot.session)
+                putInt(snapshot.uptime + 2000)
+                putShort(id.toShort())
+                putShort(0)
+                putInt(0)
+            }
+            .array()
     }
 
     fun header(bytes: ByteArray, type: Int): Boolean =
