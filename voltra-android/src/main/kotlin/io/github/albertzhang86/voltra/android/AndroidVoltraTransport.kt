@@ -20,12 +20,13 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 internal object VoltraGatt {
+    private const val TAG = "VoltraGatt"
     private val connectionIds = AtomicInteger()
 
     fun nextConnectionId(): Int = connectionIds.incrementAndGet()
 
     fun trace(message: String) {
-        if (Log.isLoggable("VoltraGatt", Log.DEBUG)) Log.d("VoltraGatt", message)
+        if (Log.isLoggable(TAG, Log.DEBUG)) Log.d(TAG, message)
     }
 
     val service: UUID = UUID.fromString("e4dada34-0867-8783-9f70-2ca29216c7e4")
