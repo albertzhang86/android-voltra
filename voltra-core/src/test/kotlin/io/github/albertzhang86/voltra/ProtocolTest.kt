@@ -6,6 +6,71 @@ import org.junit.Test
 
 class ProtocolTest {
     @Test
+    fun `native firmware 2 load cycle preserves raw words and rejects unknown command encodings`() {
+        val loaded = requireNotNull(VoltraDecoder.decode(VoltraProtocol.hex("5513040310aa92012000100100893e010042fc")))
+        val unloaded = requireNotNull(VoltraDecoder.decode(VoltraProtocol.hex("5513040310aaa7012000100100893e0000917d")))
+        assertEquals(1, loaded.registers[VoltraProtocol.FITNESS])
+        assertEquals(0, unloaded.registers[VoltraProtocol.FITNESS])
+        assertTrue(MotorState.loaded(loaded.registers[VoltraProtocol.FITNESS]))
+        assertTrue(MotorState.unloaded(unloaded.registers[VoltraProtocol.FITNESS]))
+        assertTrue(VoltraProtocol.motorCommand(0, true).contentEquals(VoltraProtocol.write(VoltraProtocol.FITNESS, 1, 2)))
+        assertTrue(VoltraProtocol.motorCommand(1, false).contentEquals(VoltraProtocol.write(VoltraProtocol.FITNESS, 0, 2)))
+        for (unknown in listOf(null, -1, 2, 3, 0x100, 0x101, 0x105, 0x204, 65535)) {
+            assertFalse(MotorState.unloaded(unknown))
+            assertFalse(MotorState.loaded(unknown))
+            assertNull(MotorState.commandValue(unknown, true))
+            assertNull(MotorState.commandValue(unknown, false))
+        }
+    }
+
+    @Test
+    fun `firmware 2 settings cascade preserves selected mode and raw idle motor report`() {
+        // VTR-161230 capture, 2026-10-28. Its screen showed Weight Training.
+        val packet = VoltraProtocol.hex(
+            "552e04a710aa0d002000100900863e2d00873e1a00883e1300893e0000025109035108b04f01e14e01245100ff35"
+        )
+        assertTrue(VoltraProtocol.valid(packet))
+        val decoded = requireNotNull(VoltraDecoder.decode(packet))
+        assertEquals(1, decoded.registers[VoltraProtocol.MODE])
+        assertEquals(0, decoded.registers[VoltraProtocol.FITNESS])
+        assertEquals(45, decoded.registers[Parameter.WEIGHT.register])
+        assertNull(decoded.activeWeightLb)
+        // Unknown semantics are not promoted to writable parameters or motor capability.
+        assertTrue(Parameter.entries.none { it.register in listOf(0x5102, 0x4ee1, 0x5124) })
+        val unsupportedField = packet.copyOf().also { it[29] = 0xff.toByte() }
+        assertNull(VoltraDecoder.decode(VoltraProtocol.seal(unsupportedField)))
+    }
+
+    @Test
+    fun `captured cable query and SETUP both report two centimeters beyond saved zero`() {
+        // VTR-161230 USB capture, 2026-10-17. The user reported the cable fully
+        // returned. Preserve actual packets: this is device evidence, not a
+        // synthesized zero or a weight/length-unit conversion.
+        for (hex in listOf(
+            "551b08d610aa002020000f000300823e02006a5000001150008a5b",
+            "5518088310aa150020000f0002006a500000823e02000946",
+        )) {
+            val packet = VoltraProtocol.hex(hex)
+            assertTrue(VoltraProtocol.valid(packet))
+            val decoded = requireNotNull(VoltraDecoder.decode(packet))
+            assertEquals(2, decoded.registers[VoltraProtocol.CABLE_POSITION])
+            assertEquals(0, decoded.registers[VoltraProtocol.CABLE_OFFSET])
+            assertFalse(decoded.registers.containsKey(Parameter.WEIGHT.register))
+            assertNull(decoded.activeWeightLb)
+        }
+    }
+
+    @Test
+    fun `captured flagged ready notification preserves raw fitness and idle mode`() {
+        val packet = VoltraProtocol.hex("551604fc10aa0c1c2000100200893e0401b04f007153")
+        assertTrue(VoltraProtocol.valid(packet))
+        val decoded = VoltraDecoder.decode(packet)!!
+        assertEquals(0x0104, decoded.registers[VoltraProtocol.FITNESS])
+        assertEquals(0, decoded.registers[VoltraProtocol.MODE])
+        assertFalse(decoded.registers.containsKey(0x53b7))
+    }
+
+    @Test
     fun `runtime wire weight is signed whole pounds and separate from base weight or stream force`() {
         for (value in listOf(0, 59, -1, -32768, 32767)) {
             val decoded =

@@ -20,11 +20,57 @@ class KnobVoltraController(
     private var rememberedDevice = rememberedDevice
     private var telemetryEpoch = 0L
     private var topologyRevision = 0L
+    private val trainerEpochs = TrainerTelemetryEpochs<KnobTelemetrySource>()
     private val mutableState = MutableStateFlow(disconnectedState())
     override val state = mutableState.asStateFlow()
     private val commands = Mutex()
     private val writes = Mutex()
     private val offers = Mutex()
+    private val activityWrites = Mutex()
+    private val activityScopes = linkedMapOf<Long, SetupActivity>()
+    private var activityToken = 0L
+    private var activitySent = false
+    private var activityEpoch: Int? = null
+    private var activityDeadline: Int? = null
+
+    override fun beginSetupActivity(activity: SetupActivity): AutoCloseable {
+        val token = ++activityToken
+        activityScopes[token] = activity
+        updateState { it }
+        scope.launch { sendSetupActivity() }
+        return AutoCloseable {
+            if (activityScopes.remove(token) != null) {
+                updateState { it }
+                scope.launch { sendSetupActivity() }
+            }
+        }
+    }
+
+    private suspend fun sendSetupActivity() = activityWrites.withLock {
+        val current = snapshot ?: return@withLock
+        val age = now() - receivedAt
+        if (!current.setupActivitySupported || age !in 0..2000 || !job.isActive)
+            return@withLock
+        val activity = activityScopes.values.firstOrNull()
+        if (activity == null && !activitySent) return@withLock
+        val deviceNow = current.uptime + age.toInt()
+        var deadline = deviceNow + 1500
+        if (activityEpoch == current.epoch) {
+            activityDeadline?.let { if (deadline - it <= 0) deadline = it + 1 }
+        }
+        if (deadline - deviceNow > 2000) return@withLock
+        try {
+            write(KnobProtocol.setupActivity(current, activity, deadline))
+            activityEpoch = current.epoch
+            activityDeadline = deadline
+            activitySent = activity != null
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // Presentation is best-effort. The expiring display lease cannot
+            // fail, retry, authorize or conceal the result of a motor command.
+        }
+    }
     private var lastOfferDeadline: Int? = null
     private var lastOfferEpoch: Int? = null
     private var lastOfferSession: Int? = null
@@ -41,6 +87,40 @@ class KnobVoltraController(
     private var repSource: RepSource? = null
 
     private data class RepSource(val controllerId: String, val peerId: String?, val modeWire: Int?)
+
+    private data class KnobTelemetrySource(
+        val generation: Int,
+        val transportEpoch: Long,
+        val epoch: Int?,
+        val session: Int?,
+        val trainer: TrainerTelemetrySource,
+        val twin: Pair<String, String>?,
+    )
+
+    private inline fun updateState(transform: (VoltraState) -> VoltraState) =
+        publish(transform(mutableState.value))
+
+    private fun publish(next: VoltraState) {
+        mutableState.value =
+            next.copy(
+                knob = next.knob?.copy(setupActivity = activityScopes.values.firstOrNull()
+                    ?: snapshot?.setupActivity?.takeIf {
+                        next.knob.status == ConnectionStatus.READY && now() - receivedAt <= 2000
+                    }),
+                trainerTelemetryEpochs = trainerEpochs.update(
+                    next.trainers.associate { trainer ->
+                        trainer.device.id to KnobTelemetrySource(
+                            generation,
+                            telemetryEpoch,
+                            snapshot?.epoch,
+                            snapshot?.session,
+                            trainer.telemetrySource(),
+                            next.twin?.let { it.controllerId.lowercase() to it.peerId.lowercase() },
+                        )
+                    }
+                )
+            )
+    }
 
     private var pending: Pending? = null
     private var generation = 0
@@ -59,9 +139,15 @@ class KnobVoltraController(
     init {
         scope.launch {
             while (isActive) {
+                delay(750)
+                sendSetupActivity()
+            }
+        }
+        scope.launch {
+            while (isActive) {
                 delay(250)
                 if (snapshot != null && now() - receivedAt >= 500) {
-                    mutableState.update { state ->
+                    updateState { state ->
                         state.copy(
                             trainers = state.trainers.map { it.copy(cableMoving = null) },
                             twin = state.twin?.copy(measuredForceLb = null, cableMoving = null),
@@ -69,7 +155,7 @@ class KnobVoltraController(
                     }
                 }
                 if (snapshot != null && now() - receivedAt > 2000) {
-                    mutableState.update {
+                    updateState {
                         it.copy(
                             twin =
                                 it.twin?.copy(
@@ -125,12 +211,13 @@ class KnobVoltraController(
             "Disconnect the current knob first."
         }
         val token = ++generation
-        mutableState.value =
+        publish(
             VoltraState(
                 knob = KnobState(device, ConnectionStatus.CONNECTING),
                 viaKnob = true,
                 telemetryEpoch = telemetryEpoch,
             )
+        )
         connection =
             scope.launch {
                 var opened: VoltraLink? = null
@@ -193,13 +280,15 @@ class KnobVoltraController(
                                         2 ->
                                             request.completion.completeExceptionally(
                                                 IllegalStateException(
-                                                    "Knob rejected the change. Check the trainer and retry."
+                                                    motorError(result.reason)
+                                                        ?: "Knob rejected the change. Check the trainer and retry."
                                                 )
                                             )
                                         3 ->
                                             request.completion.completeExceptionally(
                                                 IllegalStateException(
-                                                    "VOLTRA did not confirm the change."
+                                                    motorError(result.reason)
+                                                        ?: "VOLTRA did not confirm the change."
                                                 )
                                             )
                                     }
@@ -233,6 +322,20 @@ class KnobVoltraController(
             }
     }
 
+    private fun motorError(reason: Int): String? =
+        when (reason) {
+            1 -> "VOLTRA is busy or not ready for load control."
+            2 -> "VOLTRA has not confirmed its cable zero position. Check the cable position before retrying."
+            3 -> "VOLTRA mode or Twin connection changed."
+            4 -> "Load control expired or its connection was revoked."
+            5 -> "The motor command could not be sent. Check VOLTRA before retrying."
+            6 -> "VOLTRA did not confirm the motor command."
+            7 -> "Cable-zero readings are unavailable. Wait for fresh VOLTRA readings."
+            8 -> "VOLTRA settings changed during load preparation."
+            9 -> "VOLTRA settings could not be verified before loading."
+            else -> null
+        }
+
     private fun failConnection(token: Int, failure: Exception) {
         if (generation != token) return
         telemetryEpoch++
@@ -243,7 +346,7 @@ class KnobVoltraController(
         waitingForFirstRep = false
         repTrainerId = null
         repSource = null
-        mutableState.update {
+        updateState {
             it.copy(
                 trainers = emptyList(),
                 twin = null,
@@ -263,8 +366,28 @@ class KnobVoltraController(
         }
     }
 
+    private var motorContextRevision = 0L
+
     private fun receive(update: KnobProtocol.Snapshot) {
         val old = snapshot
+        val oldMotorPeer = old?.peer?.id.takeIf { old?.trainer?.twinReported == true }
+        val newMotorPeer = update.peer?.id.takeIf { update.trainer?.twinReported == true }
+        if (
+            old != null &&
+                (old.epoch != update.epoch ||
+                    old.session != update.session ||
+                    old.trainer?.mode != update.trainer?.mode ||
+                    old.trainer?.parameters?.filterKeys {
+                        it in Parameter.forMode(old.trainer.mode)
+                    } !=
+                        update.trainer?.parameters?.filterKeys {
+                            it in Parameter.forMode(update.trainer.mode)
+                        } ||
+                    old.trainer?.twinReported != update.trainer?.twinReported ||
+                    !old.trainer?.device?.id.equals(update.trainer?.device?.id, true) ||
+                    !oldMotorPeer.equals(newMotorPeer, true))
+        )
+            motorContextRevision++
         val trainerId = update.trainer?.device?.id
         if (
             old != null &&
@@ -343,7 +466,7 @@ class KnobVoltraController(
             }
         val peer =
             update.peer
-                ?.takeIf { trainer?.twinReported == true && update.version == 2 }
+                ?.takeIf { trainer?.twinReported == true && update.version >= 2 }
                 ?.let { device ->
                     requireNotNull(trainer)
                         .copy(
@@ -360,6 +483,10 @@ class KnobVoltraController(
                             deviceReps = null,
                             editableParameters = emptySet(),
                             modeChangeAllowed = false,
+                            loadControlSupported = false,
+                            loadAllowed = false,
+                            unloadAllowed = false,
+                            loadPreparationAllowed = false,
                         )
                 }
         val pair =
@@ -376,10 +503,10 @@ class KnobVoltraController(
                     deviceReps = raw.takeUnless { trainer.pending },
                 )
             else null
-        mutableState.update {
+        updateState {
             it.copy(
                 twin = pair,
-                twinSupported = update.version == 2,
+                twinSupported = update.version >= 2,
                 topologyRevision = ++topologyRevision,
                 telemetryEpoch = telemetryEpoch,
                 trainers = listOfNotNull(trainer, peer),
@@ -424,7 +551,7 @@ class KnobVoltraController(
         lastOfferDeadline = null
         lastOfferEpoch = null
         lastOfferSession = null
-        mutableState.value = disconnectedState()
+        publish(disconnectedState())
     }
 
     private fun disconnectedState() =
@@ -451,6 +578,111 @@ class KnobVoltraController(
     override suspend fun setParameter(deviceId: String, parameter: Parameter, value: Int) =
         change(deviceId, null, parameter, value)
 
+    override suspend fun setLoaded(deviceId: String, loaded: Boolean) = connectionCommand {
+        val current = requireNotNull(snapshot) { "Connect the knob first." }
+        val trainer =
+            state.value.trainers.singleOrNull { it.device.id.equals(deviceId, true) }
+                ?: error("Select the knob's active trainer.")
+        check(
+            job.isActive &&
+                now() - receivedAt in 0..1500 &&
+                trainer.connected &&
+                trainer.fresh &&
+                !trainer.pending &&
+                trainer.mode != null &&
+                trainer.twinStatusKnown &&
+                (!trainer.twinReported ||
+                    (trainer.twinVerified && trainer.twinRole == TwinRole.CONTROLLER))
+        ) {
+            "A fresh, confirmed knob controller is required for load control."
+        }
+        if (if (loaded) trainer.loaded else isFitnessReady(trainer.fitnessMode))
+            return@connectionCommand
+        check(trainer.loadControlSupported) {
+            "Update the knob firmware to enable confirmed load control."
+        }
+        check(if (loaded) trainer.canLoad || trainer.canPrepareLoad else trainer.canUnload) {
+            if (loaded) "VOLTRA is not ready to load. Check its controls and connection."
+            else "VOLTRA cannot unload in its current state."
+        }
+        check(nextId <= 65535) { "Reconnect the knob before sending more changes." }
+        val contextRevision = motorContextRevision
+        val motorLink = requireNotNull(link)
+        val request = Pending(current.epoch, current.session, nextId++, CompletableDeferred())
+        pending = request
+        updateState {
+            it.copy(trainers = it.trainers.map { trainer -> trainer.copy(pending = true) })
+        }
+        try {
+            write(KnobProtocol.motorCommand(current, request.id, loaded))
+            withTimeout(6_000) {
+                request.completion.await()
+                snapshots.first { observed ->
+                    if (observed == null) return@first false
+                    check(
+                        motorContextRevision == contextRevision &&
+                            observed.epoch == current.epoch &&
+                            observed.session == current.session &&
+                            observed.trainer
+                                ?.device
+                                ?.id
+                                .equals(current.trainer?.device?.id, true) &&
+                            observed.trainer?.mode == trainer.mode &&
+                            observed.trainer?.twinReported == trainer.twinReported &&
+                            (!trainer.twinReported ||
+                                observed.peer?.id.equals(current.peer?.id, true))
+                    ) {
+                        "VOLTRA mode or connection changed during load control."
+                    }
+                    observed.uptime - current.uptime > 0 &&
+                        now() - receivedAt in 0..1500 &&
+                        observed.trainer?.fresh == true &&
+                        !observed.trainer.pending &&
+                        if (loaded) observed.trainer.loaded
+                        else isFitnessReady(observed.trainer.fitnessMode)
+                }
+            }
+        } catch (failure: TimeoutCancellationException) {
+            revokeCommandConnection(motorLink)
+            currentCoroutineContext().ensureActive()
+            error(
+                "VOLTRA did not confirm ${if (loaded) "loading" else "unloading"}. Check the trainer before reconnecting."
+            )
+        } catch (cancelled: CancellationException) {
+            // A cancelled await cannot retract an accepted BLE command. Revoke its session so
+            // queued setup cannot later send GO. A GO already transmitted remains uncertain.
+            revokeCommandConnection(motorLink)
+            throw cancelled
+        } finally {
+            pending = null
+            updateState {
+                it.copy(
+                    trainers =
+                        it.trainers.map { trainer ->
+                            trainer.copy(pending = snapshot?.trainer?.pending ?: false)
+                        }
+                )
+            }
+        }
+    }
+
+    private suspend fun revokeCommandConnection(active: VoltraLink) {
+        withContext(NonCancellable) {
+            try {
+                withTimeout(750) { active.revoke() }
+            } catch (_: Exception) {
+                /* Closing still revokes the physical session on disconnect. */
+            } finally {
+                active.close()
+            }
+        }
+        if (link === active) {
+            // Preserve the caller's timeout/error while cancelling every other queued operation.
+            commandJobs -= currentCoroutineContext().job
+            state.value.knob?.device?.id?.let(::disconnect)
+        }
+    }
+
     private suspend fun change(
         deviceId: String,
         mode: TrainingMode?,
@@ -471,7 +703,7 @@ class KnobVoltraController(
         check(nextId <= 65535) { "Reconnect the knob before sending more changes." }
         val request = Pending(current.epoch, current.session, nextId++, CompletableDeferred())
         pending = request
-        mutableState.update {
+        updateState {
             it.copy(trainers = it.trainers.map { trainer -> trainer.copy(pending = true) })
         }
         try {
@@ -491,7 +723,7 @@ class KnobVoltraController(
             }
         } finally {
             pending = null
-            mutableState.update {
+            updateState {
                 it.copy(
                     trainers =
                         it.trainers.map { trainer ->
@@ -571,9 +803,10 @@ class KnobVoltraController(
             "Finish training on both trainers before changing Twin mode."
         }
         check(nextId <= 65535)
+        val twinLink = requireNotNull(link)
         val request = Pending(current.epoch, current.session, nextId++, CompletableDeferred())
         pending = request
-        mutableState.update { it.copy(twinPending = true) }
+        updateState { it.copy(twinPending = true) }
         try {
             write(KnobProtocol.twinCommand(current, request.id, create))
             withTimeout(45_000) {
@@ -592,9 +825,19 @@ class KnobVoltraController(
                 }
                 Unit
             }
+        } catch (failure: TimeoutCancellationException) {
+            revokeCommandConnection(twinLink)
+            currentCoroutineContext().ensureActive()
+            error("Twin change was not confirmed. Check both trainers before reconnecting.")
+        } catch (cancelled: CancellationException) {
+            // An accepted Twin request can still be unloading or pairing on the worker.
+            // Revoke the logical session before closing, so cancellation cannot leave those
+            // queued topology writes authorized. Already transmitted writes remain uncertain.
+            revokeCommandConnection(twinLink)
+            throw cancelled
         } finally {
             pending = null
-            mutableState.update {
+            updateState {
                 it.copy(
                     twinPending = false,
                     trainers =
@@ -640,7 +883,7 @@ class KnobVoltraController(
             else freshTrainer?.deviceReps
         baseline = raw ?: 0
         waitingForFirstRep = raw == null
-        mutableState.update {
+        updateState {
             it.copy(
                 twin = it.twin?.copy(reps = raw?.let { 0 }),
                 trainers =

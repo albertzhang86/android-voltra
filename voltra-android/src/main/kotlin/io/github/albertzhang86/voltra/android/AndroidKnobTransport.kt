@@ -31,6 +31,8 @@ class AndroidKnobTransport(context: Context) : VoltraTransport {
                 minimumMtu = KnobProtocol.MIN_MTU,
                 connectTimeoutMs = 90_000,
                 label = "Knob",
+                renewNotificationSubscription = true,
+                retryEstablishment = false,
             ),
         )
 
@@ -80,15 +82,25 @@ class AndroidKnobTransport(context: Context) : VoltraTransport {
         val link = transport.connect(device)
         return object : VoltraLink {
             private var lastSnapshotTraceAt = 0L
+            private var lastSnapshotState: List<Byte>? = null
 
             override val packets =
                 link.packets.onEach { frame ->
                     if (Log.isLoggable(TRACE_TAG, Log.DEBUG)) {
                         val now = SystemClock.elapsedRealtime()
                         val snapshot = KnobProtocol.header(frame, KnobProtocol.SNAPSHOT)
-                        if (!snapshot || now - lastSnapshotTraceAt >= 1000) {
+                        // Always capture readiness/session changes, even if they recover inside
+                        // the one-second periodic sample. Telemetry values remain rate-limited.
+                        val state = if (snapshot && frame.size >= 82) {
+                            (3..11).map { frame[it] } + listOf(frame[16], frame[19], frame[20], frame[21]) +
+                                frame.slice(64 until minOf(frame.size, 134))
+                        } else null
+                        if (!snapshot || state != lastSnapshotState || now - lastSnapshotTraceAt >= 1000) {
                             trace("RX", frame)
-                            if (snapshot) lastSnapshotTraceAt = now
+                            if (snapshot) {
+                                lastSnapshotTraceAt = now
+                                lastSnapshotState = state
+                            }
                         }
                     }
                 }
@@ -99,6 +111,8 @@ class AndroidKnobTransport(context: Context) : VoltraTransport {
             }
 
             override fun close() = link.close()
+
+            override suspend fun revoke() = link.revoke()
         }
     }
 

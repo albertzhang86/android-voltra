@@ -31,8 +31,8 @@ with the peer represented logically rather than connected independently.
 `KnobVoltraController` and `AndroidKnobTransport` connect through the matching
 Guition VOLTRA Remote firmware. The knob owns one selected trainer; the TV receives
 readings and sends validated, expiring setting commands. Bridge v2 adds native
-Twin creation/exit and verified controller/peer identities. Motor load/unload stays
-on the knob. See [protocol and pairing](docs/knob-bridge.md).
+Twin creation/exit and verified controller/peer identities. An optional capability
+adds explicit, confirmed motor load/unload; older firmware leaves it unavailable. See [protocol and pairing](docs/knob-bridge.md).
 The JVM/demo checks and firmware build do not replace physical pairing/coexistence tests.
 
 ### Twin status
@@ -101,8 +101,9 @@ scope.launch { controller.state.collect { state -> /* render each trainer */ } }
 scope.launch {
     // Explicit user action; throws if unavailable, stale, or not confirmed.
     controller.setParameter(chosenDevice.id, Parameter.WEIGHT, 40)
+    controller.setLoaded(chosenDevice.id, true) // Explicit, confirmed motor action.
+    controller.beginSet() // Local rep boundary; no motor command.
 }
-controller.beginSet() // Local rep boundary; no motor command.
 // On permanent disposal, on the owner dispatcher:
 controller.close()
 scope.cancel()
@@ -112,6 +113,27 @@ Use a long-lived owner scope when the app displays a workout overlay. A dead app
 peer. Mixed handoff can also restore the former direct peer after a confirmed
 failed creation or a separately observed local-knob exit; uncertain topology
 blocks restoration until fresh state proves that reconnecting is safe.
+
+An uncertain mixed Twin result exposes `recoverableKnobId` for the original
+trusted knob. That exact knob may reconnect despite `connectionError`; a fresh
+snapshot must confirm the original pair or independent controller before control
+is restored. Cancelling that reconnect preserves the uncertainty block. Recovery
+does not replay a Twin request, change resistance, or silently reconnect the peer.
+
+The Android direct transport retries an early GATT establishment failure once,
+after one second, within the original connection deadline. Only connection-status
+133 or 0x3e before service discovery qualify. Authentication, subscription and
+established-link failures are not retried; the knob transport retains its separate
+session policy. Optional `VoltraGatt` debug logging records connection phase and
+close reason without device addresses or packet contents.
+
+Workouts should bind continuity to `state.telemetryEpochFor(controllerId, peerId)`;
+omit `peerId` for a single-trainer set. The per-trainer revisions preserve source
+changes across conflated snapshots, including disconnect/reconnect and mode or
+topology changes, without invalidating a set when another independent trainer
+finishes connecting. Removed identities retain revisions so an old connection
+cannot be mistaken for a new one. The aggregate `telemetryEpoch` remains available;
+custom connectors without per-trainer revisions use it as the compatibility fallback.
 
 Call `controller.forget(deviceId)` to reset an app connection: it disconnects,
 cancels pending settings/topology work and removes cached identity/readings. For a
@@ -123,8 +145,8 @@ forget its knob connection; relayed trainers are managed on the knob itself.
 
 ## Units and availability
 
-- Parameter weights are integer **pounds**; eccentric is an added signed weight, not a percentage. Base plus eccentric must be 5–200 lb.
-- `activeWeightLb` is commanded resistance, independent of `setWeightLb` and measured cable tension. Fresh independent fitness state 4 produces zero with source `UNLOADED`. In loaded states 5/21, only a fresh device-reported target produces a value with source `TARGET_FORCE`; unknown state or missing/expired target produces null. Base weight is never substituted.
+- Parameter weights are integer **pounds**; eccentric is an added signed weight, not a percentage. `ResistanceLimits` uses the trainer-reported allowed-force ceiling for Weight and Band, retaining 200 lb when that report is unavailable. Base plus eccentric must remain between 5 lb and that ceiling. Isokinetic retains its separate limits. `weightUnit` and `lengthUnit` carry the trainer's display preferences for both direct and knob connections.
+- `activeWeightLb` is commanded resistance, independent of `setWeightLb` and measured cable tension. Fresh independent unloaded reports (Firmware 2.0 state 0 or legacy state 4) produce zero with source `UNLOADED`. Loaded reports (1 or legacy 5/21) require a fresh device-reported target to produce `TARGET_FORCE`; unknown state or missing/expired target produces null. Base weight is never substituted.
 - `resistanceTargetLb` preserves the fresh optional `0xb4` target. `measuredForceLb` separately carries the first B4 word or legacy `0xaa/0x81/0x2b` measured tension. `runtimeWireWeightLb` is the coarse `0x3e83` signed whole-pound measurement, read every 250 ms plus Bluetooth processing time. Residual measured tension can be nonzero while unloaded; neither measured source is active resistance. Direct readings expire after 1.5 seconds and clear on mode, load-state, or endpoint changes.
 - B4 independent sources 0/1/2 have verified protocol fields for measured force and optional target in tenths of pounds. Their mapping is known from the Cortex decoder and captured frames; correspondence of target resistance to the trainer's display during chains/eccentric motion still requires physical validation. No target is inferred for layouts without it. Direct-TV native Twin readings remain withheld; classified knob-bridge pair readings are exposed separately on `TwinPair`.
 - `cableMoving` classifies fresh loaded movement separately from resistance target. Direct connections use signed B4 velocity from the same sample as measured force: magnitude at least 10 mm/s is moving, less is stationary, and unknown/expired motion is null. The 10 mm/s deadband is display policy, not a vendor constant. Motion expires after 500 ms, resets with the force sample on mode/load/topology changes, and cannot be carried over to a legacy force-only sample. Bridge v2 bit 7 carries the knob's verified moving-force classification; older snapshots never imply movement. A display can show `measuredForceLb` only while `cableMoving == true`, otherwise show the mode's configured setting. Damper level and Isokinetic target speed are not weight values.
@@ -134,7 +156,7 @@ forget its knob connection; relayed trainers are managed on the knob itself.
 - Speeds use mm/s. Isokinetic return speed `0` means Auto. Damper levels are zero-based; `Parameter.damperFactors` provides factors.
 - Only pull-phase rep events count. Return events, duplicates and delayed older device sets are ignored. `beginSet` establishes a local baseline; if no prior device count exists, the first observed pull counts as one. A new device set resets that baseline. Apps should call `beginSet` after their countdown.
 - Unknown, disconnected and stale readings must be shown as unavailable. Zero active resistance is reserved for a fresh explicit unloaded state or a device-reported zero target.
-- Mode/modifier changes require unloaded state. The connector permits base weight changes in the verified loaded states. Load/unload motor commands are deliberately not exposed in this version.
+- Mode/modifier changes require unloaded state. The connector permits base weight changes in the verified loaded states. Explicit `setLoaded(deviceId, loaded)` requests require fresh controller identity, supported mode and advertised admission. Loading requires verified cable-zero readbacks; no offset bypass or motor retry is performed.
 
 ## Build and test
 
@@ -188,3 +210,35 @@ loaded/stale/unknown state and ambiguous pairing outcomes block this recovery.
 The app may choose a bounded retry policy after a safely restored failure; this
 library does not blindly resend an uncertain native command. See
 [the complete bridge extension](docs/knob-bridge.md#mixed-twin-offers-and-handoff).
+
+### Explicit motor control
+
+`setLoaded(deviceId, loaded)` is separate from set telemetry. Applications must obtain user authorization for automatic loading, confirm the selected exercise settings, and call it at the intended start boundary. A successful return requires fresh device confirmation. A fresh already-loaded or already-unloaded controller is a no-op. `beginSet`, `endSet`, reconnect and discovery never issue motor commands to real hardware. Native Twin accepts only its confirmed controller ID; mixed connections route to the unique owner without controlling the other trainer.
+
+Direct loading sends the existing setup query (`0x506a` saved zero and `0x3e82` cable position), requires both new readbacks, rechecks the mode/endpoint, then sends GO once. Cable readiness uses the verified Cortex predicate `signed16(position - savedOffset) < 2`, with missing, stale and out-of-range readings rejected. It never writes a calibration offset. Unload sends STOP once. Only read-only polls follow either attempt; a timeout or cancellation never replays the motor write. The supported ready values are 4 and captured `0x0104`; loaded confirmation remains verified 5/21, and known armed `0x26`/`0x27` may be explicitly unloaded. Other fitness values are rejected.
+
+The knob bridge must advertise `loadControlSupported` and current `loadAllowed` / `unloadAllowed` flags. Newer firmware can separately advertise `loadPreparationAllowed`: `canPrepareLoad` permits a request to refresh cable evidence before the worker checks whether GO is safe. It does not make `canLoad` true. The worker requires new cable/zero and unchanged configuration readbacks, then reports a confirmed result followed by fresh loaded status. Older firmware defaults to unsupported preparation. Automated tests cover confirmation, wrong/stale cable readings, changed identity/mode/session, native Twin controller routing and one-shot failure. **Physical automatic load/unload acceptance is still pending**, including the four modes and workout transitions.
+
+### Explicit manual Twin preparation
+
+`createTwinAfterUnloading(controllerId, peerId, stillRelevant)` and
+`exitTwinAfterUnloading(stillRelevant)` are explicit user actions that confirm the
+required unloads before calling the strict native Twin operation. The planning
+predicates `canCreateTwinAfterUnloading` / `canExitTwinAfterUnloading` may enable
+the action for fresh, safely unloadable trainers. The existing `canCreateTwin`,
+`canExitTwin`, `createTwin` and `exitTwin` retain their unloaded-only guards.
+
+Preparation validates every connected participant before the first STOP, checks
+identity, route, epoch and mode between commands, and never sends GO. Independent
+trainers are unloaded separately; an existing native pair is unloaded through its
+verified controller. Missing confirmation or cancellation stops the operation
+without retrying a motor command. The caller's `stillRelevant` predicate also
+cancels waits if the screen or workflow changes.
+
+`MixedVoltraController` reserves the whole preparation through native confirmation.
+Observers see `twinPending` throughout, and unrelated mode, setting, motor, set-start
+and Twin commands cannot interleave between STOPs. The operation's scoped owner
+can run the required internal commands without exposing an unlocked public state.
+The same path handles explicit mixed Create Twin requests from the knob; it never
+automatically loads a trainer afterward. Hardware acceptance of these automatic
+unload paths remains pending.

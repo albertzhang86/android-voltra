@@ -31,6 +31,13 @@ class DirectVoltraController(
     private var twinOperationIds = emptySet<String>()
     private var connectionGeneration = 0
     private var sequence = 0
+    private val trainerEpochs = TrainerTelemetryEpochs<DirectTelemetrySource>()
+
+    private data class DirectTelemetrySource(
+        val connection: Entry?,
+        val trainer: TrainerTelemetrySource,
+        val twin: Pair<String, String>?,
+    )
 
     private data class NativePair(val controllerId: String, val peer: VoltraDevice)
 
@@ -47,8 +54,15 @@ class DirectVoltraController(
         val commandJobs = mutableSetOf<Job>()
         val revisions = mutableMapOf<Int, Long>()
         val parameterAt = mutableMapOf<Parameter, Long>()
+        val configuration = mutableMapOf<Int, Int>()
+        val configurationAt = mutableMapOf<Int, Long>()
         var statusAt: Long? = null
         var modeAt: Long? = null
+        var motorContextRevision = 0L
+        var cablePosition: Int? = null
+        var cableOffset: Int? = null
+        var cablePositionAt: Long? = null
+        var cableOffsetAt: Long? = null
         var forceAt: Long? = null
         var forceWeightLb: Double? = null
         var cableVelocityMmPerSecond: Int? = null
@@ -80,7 +94,12 @@ class DirectVoltraController(
             entry.job =
                 scope.launch {
                     try {
-                        entry.link = withTimeout(15_000) { transport.connect(device) }
+                        withTimeout(15_000) {
+                            // Take ownership before crossing the cancellable timeout boundary.
+                            // The outer finally must close a link even when cancellation wins
+                            // immediately after the transport returns it.
+                            entry.link = transport.connect(device)
+                        }
                         coroutineScope {
                             launch(start = CoroutineStart.UNDISPATCHED) {
                                 val assembler = FrameAssembler()
@@ -188,7 +207,20 @@ class DirectVoltraController(
         // Single-register reads avoid assuming different firmware versions share parameter widths.
         link.write(VoltraProtocol.read(VoltraProtocol.BATTERY))
         link.write(VoltraProtocol.read(VoltraProtocol.WEIGHT_UNIT))
+        link.write(VoltraProtocol.read(VoltraProtocol.LENGTH_UNIT))
+        link.write(VoltraProtocol.read(VoltraProtocol.MAX_ALLOWED_FORCE))
         link.write(VoltraProtocol.endpointStatus())
+        if (current(entry)?.unloaded == true) {
+            link.write(VoltraProtocol.read(VoltraProtocol.CABLE_POSITION))
+            link.write(VoltraProtocol.read(VoltraProtocol.CABLE_OFFSET))
+            val extra =
+                when (current(entry)?.mode) {
+                    TrainingMode.BAND -> VoltraProtocol.bandReadOnlySettings
+                    TrainingMode.DAMPER -> VoltraProtocol.damperReadOnlySettings
+                    else -> emptySet()
+                }
+            extra.forEach { link.write(VoltraProtocol.read(it)) }
+        }
         Parameter.forMode(current(entry)?.mode).forEach {
             link.write(VoltraProtocol.read(it.register))
         }
@@ -210,6 +242,27 @@ class DirectVoltraController(
         ) {
             clearActiveWeight(entry)
         }
+        if (modeChanged) {
+            entry.motorContextRevision++
+            entry.configuration.clear()
+            entry.configurationAt.clear()
+            entry.cablePositionAt = null
+            entry.cableOffsetAt = null
+        }
+        update.registers[VoltraProtocol.CABLE_POSITION]?.let {
+            entry.cablePosition = it
+            entry.cablePositionAt = now
+        }
+        update.registers[VoltraProtocol.CABLE_OFFSET]?.let {
+            entry.cableOffset = it
+            entry.cableOffsetAt = now
+        }
+        update.registers.forEach { (register, value) ->
+            if (register in motorRegisters(nextMode)) {
+                entry.configuration[register] = value
+                entry.configurationAt[register] = now
+            }
+        }
         update.registers.keys.forEach { entry.revisions[it] = (entry.revisions[it] ?: 0) + 1 }
         if (VoltraProtocol.FITNESS in update.registers) entry.statusAt = now
         if (VoltraProtocol.MODE in update.registers) entry.modeAt = now
@@ -217,6 +270,14 @@ class DirectVoltraController(
             ?.takeIf { it.sequence == entry.twinSequence }
             ?.let { entry.twinReply?.complete(it) }
         update.endpoint?.let { endpoint ->
+            val oldEndpoint = entry.endpoint
+            if (
+                oldEndpoint != null &&
+                    (oldEndpoint.localAddress != endpoint.localAddress ||
+                        oldEndpoint.peerAddress != endpoint.peerAddress ||
+                        oldEndpoint.pairingStatus != endpoint.pairingStatus)
+            )
+                entry.motorContextRevision++
             // Android IDs are MAC addresses. Opaque transport IDs remain supported for other hosts.
             val addressId = entry.device.id.matches(Regex("[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}"))
             if (addressId && !entry.device.id.equals(endpoint.localAddress, ignoreCase = true))
@@ -269,7 +330,7 @@ class DirectVoltraController(
                 update.resistanceTargetLb?.takeIf {
                     it in 0.0..1000.0 &&
                         telemetryAvailable(entry, now, nextMode) &&
-                        nextFitness in listOf(5, 21)
+                        isFitnessLoaded(nextFitness)
                 }
             entry.targetAt = now.takeIf { entry.targetWeightLb != null }
         }
@@ -299,7 +360,7 @@ class DirectVoltraController(
             val parameters = if (modeChanged) mutableMapOf() else old.parameters.toMutableMap()
             Parameter.entries.forEach { parameter ->
                 update.registers[parameter.register]?.let { value ->
-                    if (runCatching { parameter.validate(value) }.isSuccess) {
+                    if (runCatching { parameter.validateWireValue(value) }.isSuccess) {
                         parameters[parameter] = value
                         entry.parameterAt[parameter] = now
                     }
@@ -320,6 +381,12 @@ class DirectVoltraController(
                     if (VoltraProtocol.WEIGHT_UNIT in update.registers)
                         WeightUnit.fromWire(update.registers.getValue(VoltraProtocol.WEIGHT_UNIT))
                     else old.weightUnit,
+                resistanceLimits = update.registers[VoltraProtocol.MAX_ALLOWED_FORCE]?.let { maximum ->
+                    if (maximum in 5..250) ResistanceLimits(maximum, LimitSource.DEVICE) else ResistanceLimits()
+                } ?: old.resistanceLimits,
+                lengthUnit = if (VoltraProtocol.LENGTH_UNIT in update.registers)
+                    LengthUnit.fromWire(update.registers.getValue(VoltraProtocol.LENGTH_UNIT))
+                    else old.lengthUnit,
                 batteryPercent =
                     update.endpoint?.localBatteryPercent
                         ?: update.registers[VoltraProtocol.BATTERY]?.takeIf { it in 0..100 }
@@ -355,8 +422,8 @@ class DirectVoltraController(
 
     override suspend fun setParameter(deviceId: String, parameter: Parameter, value: Int) =
         command(deviceId) { entry ->
-            parameter.validate(value)
             val snapshot = requireNotNull(current(entry))
+            snapshot.resistanceLimits.validate(parameter, value)
             check(snapshot.canEdit(parameter)) {
                 "This setting is unavailable in the trainer's current state."
             }
@@ -367,8 +434,8 @@ class DirectVoltraController(
                 val eccentric =
                     if (parameter == Parameter.ECCENTRIC) value
                     else snapshot.parameters[Parameter.ECCENTRIC]
-                require(weight != null && eccentric != null && weight + eccentric in 5..200) {
-                    "Combined weight must stay within 5–200 lb."
+                require(weight != null && eccentric != null && weight + eccentric in snapshot.resistanceLimits.range(Parameter.WEIGHT)) {
+                    "Combined weight exceeds this VOLTRA’s range."
                 }
             }
             confirmedWrite(entry, parameter.register, value, parameter.width) {
@@ -376,8 +443,124 @@ class DirectVoltraController(
             }
         }
 
+    override suspend fun setLoaded(deviceId: String, loaded: Boolean) =
+        command(deviceId) { entry ->
+            val initial = requireNotNull(current(entry))
+            check(
+                listOf(entry.statusAt, entry.modeAt).all {
+                    it != null && monotonicMillis() - it in 0..1500
+                } &&
+                    initial.connected &&
+                    initial.fresh &&
+                    !initial.pending &&
+                    initial.mode != null &&
+                    initial.twinStatusKnown &&
+                    (!initial.twinReported ||
+                        (initial.twinVerified && initial.twinRole == TwinRole.CONTROLLER))
+            ) {
+                "A fresh, confirmed trainer controller is required for load control."
+            }
+            if (if (loaded) initial.loaded else isFitnessReady(initial.fitnessMode)) return@command
+            check(if (loaded) initial.canLoad || initial.canPrepareLoad else initial.canUnload) {
+                if (loaded) "VOLTRA is not ready to load. Check its controls and connection."
+                else "VOLTRA cannot unload in its current state."
+            }
+            val expectedEndpoint = requireNotNull(entry.endpoint)
+            val expectedContext = entry.motorContextRevision
+            val expectedSettings =
+                entry.configuration.filterKeys { it in motorRegisters(initial.mode) }
+            fun guard(): TrainerState {
+                check(entries[deviceId] === entry && !twinPending) { "VOLTRA connection changed." }
+                val current = requireNotNull(current(entry))
+                val endpoint = entry.endpoint
+                check(
+                    entry.motorContextRevision == expectedContext &&
+                        listOf(entry.statusAt, entry.modeAt).all {
+                            it != null && monotonicMillis() - it in 0..1500
+                        } &&
+                        current.connected &&
+                        current.fresh &&
+                        current.mode == initial.mode &&
+                        endpointFresh(entry) &&
+                        endpoint?.topologyKnown == true &&
+                        endpoint.localAddress.equals(expectedEndpoint.localAddress, true) &&
+                        endpoint.peerAddress.equals(expectedEndpoint.peerAddress, true) &&
+                        endpoint.paired == expectedEndpoint.paired
+                ) {
+                    "VOLTRA mode or connection changed during load control."
+                }
+                return current
+            }
+            change(entry) { it.copy(pending = true, error = null) }
+            try {
+                withTimeout(5_000) {
+                    val link = requireNotNull(entry.link)
+                    if (loaded) {
+                        val positionRevision = entry.revisions[VoltraProtocol.CABLE_POSITION] ?: 0
+                        val offsetRevision = entry.revisions[VoltraProtocol.CABLE_OFFSET] ?: 0
+                        val settingsRevisions =
+                            expectedSettings.keys.associateWith { entry.revisions[it] ?: 0 }
+                        guard()
+                        // One setup query, followed by new actual cable readbacks. Never change
+                        // offset.
+                        link.write(VoltraProtocol.motorSetup())
+                        expectedSettings.keys.forEach { link.write(VoltraProtocol.read(it)) }
+                        withTimeout(1_500) {
+                            while (
+                                (entry.revisions[VoltraProtocol.CABLE_POSITION] ?: 0) <=
+                                    positionRevision ||
+                                    (entry.revisions[VoltraProtocol.CABLE_OFFSET] ?: 0) <=
+                                        offsetRevision ||
+                                    settingsRevisions.any { (register, revision) ->
+                                        (entry.revisions[register] ?: 0) <= revision
+                                    }
+                            ) {
+                                guard()
+                                delay(25)
+                            }
+                        }
+                        val readyToLoad = guard()
+                        check(
+                            entry.configuration.filterKeys { it in motorRegisters(initial.mode) } ==
+                                expectedSettings
+                        ) {
+                            "VOLTRA settings changed during load preparation."
+                        }
+                        check(readyToLoad.copy(pending = false).canLoad) {
+                            "VOLTRA has not confirmed its cable zero position. Check the cable position before retrying."
+                        }
+                    } else check(guard().copy(pending = false).canUnload)
+                    val statusRevision = entry.revisions[VoltraProtocol.FITNESS] ?: 0
+                    // Motor writes are one-shot. Only read-only status polls follow this attempt.
+                    link.write(
+                        VoltraProtocol.motorCommand(guard().fitnessMode, loaded)
+                    )
+                    while (true) {
+                        val observed = guard()
+                        if (
+                            (entry.revisions[VoltraProtocol.FITNESS] ?: 0) > statusRevision &&
+                                if (loaded) observed.loaded
+                                else isFitnessReady(observed.fitnessMode)
+                        )
+                            break
+                        link.write(VoltraProtocol.read(VoltraProtocol.FITNESS))
+                        delay(100)
+                    }
+                }
+            } catch (failure: TimeoutCancellationException) {
+                currentCoroutineContext().ensureActive()
+                error(
+                    "VOLTRA did not confirm ${if (loaded) "loading" else "unloading"}. Check the trainer before retrying."
+                )
+            } finally {
+                change(entry) { it.copy(pending = false) }
+            }
+        }
+
     private suspend fun command(deviceId: String, block: suspend (Entry) -> Unit) =
-        withContext(scope.coroutineContext) {
+        // Retain the caller's Job so cancelling preparation cannot send a later GO from setup.
+        // Connection close still cancels every tracked command on this owner dispatcher.
+        withContext(scope.coroutineContext.minusKey(Job)) {
             val entry = requireNotNull(entries[deviceId]) { "Connect VOLTRA first." }
             val operation = currentCoroutineContext().job
             entry.commandJobs += operation
@@ -427,7 +610,7 @@ class DirectVoltraController(
     }
 
     override suspend fun createTwin(controllerId: String, peerId: String): Unit =
-        withContext(scope.coroutineContext) {
+        withContext(scope.coroutineContext.minusKey(Job)) {
             val generation = connectionGeneration
             twinCommands.withLock {
                 check(generation == connectionGeneration) { "Device connections changed." }
@@ -472,7 +655,7 @@ class DirectVoltraController(
         }
 
     override suspend fun exitTwin() =
-        withContext(scope.coroutineContext) {
+        withContext(scope.coroutineContext.minusKey(Job)) {
             val generation = connectionGeneration
             twinCommands.withLock {
                 check(generation == connectionGeneration) { "Device connections changed." }
@@ -620,8 +803,8 @@ class DirectVoltraController(
         fitnessMode: Int? = entry.snapshot.fitnessMode,
     ): ActiveReading? {
         if (twinReported || !telemetryAvailable(entry, now, mode)) return null
-        if (fitnessMode == 4) return ActiveReading(0.0, ActiveWeightSource.UNLOADED)
-        if (fitnessMode !in listOf(5, 21)) return null
+        if (isFitnessReady(fitnessMode)) return ActiveReading(0.0, ActiveWeightSource.UNLOADED)
+        if (!isFitnessLoaded(fitnessMode)) return null
         if (entry.targetAt?.let { now - it <= 1500 } == true)
             entry.targetWeightLb?.let {
                 return ActiveReading(it, ActiveWeightSource.TARGET_FORCE)
@@ -644,7 +827,7 @@ class DirectVoltraController(
         mode: TrainingMode? = entry.snapshot.mode,
         fitnessMode: Int? = entry.snapshot.fitnessMode,
     ): Boolean? {
-        if (fitnessMode !in listOf(5, 21) || !telemetryAvailable(entry, now, mode)) return null
+        if (!isFitnessLoaded(fitnessMode) || !telemetryAvailable(entry, now, mode)) return null
         if (entry.forceWeightLb == null || entry.forceAt?.let { now - it <= 500 } != true)
             return null
         // A small deadband avoids treating stationary sensor noise as a pull. Both
@@ -686,12 +869,69 @@ class DirectVoltraController(
     }
 
     /** A native Twin has one BLE session; the peer is reported by that controller. */
+    private fun motorRegisters(mode: TrainingMode?): Set<Int> =
+        Parameter.forMode(mode).map { it.register }.toSet() +
+            when (mode) {
+                TrainingMode.BAND -> VoltraProtocol.bandReadOnlySettings
+                TrainingMode.DAMPER -> VoltraProtocol.damperReadOnlySettings
+                else -> emptySet()
+            }
+
+    private fun motorReadiness(entry: Entry): TrainerState {
+        val now = monotonicMillis()
+        val cableFresh =
+            listOf(entry.cablePositionAt, entry.cableOffsetAt).all {
+                it != null && now - it in 0..1500
+            }
+        // Cortex uses signed16(position - savedOffset) < 2. Reject absent/sentinel readings;
+        // this never invents a cable offset or changes the device's zero calibration.
+        val position = entry.cablePosition
+        val offset = entry.cableOffset
+        val cableZero =
+            cableFresh &&
+                position != null &&
+                offset != null &&
+                position in 0..32767 &&
+                offset in 0..32767 &&
+                (position - offset).toShort().toInt() < 2
+        val settingsFresh =
+            motorRegisters(entry.snapshot.mode).all { register ->
+                register in entry.configuration &&
+                    entry.configurationAt[register]?.let { now - it in 0..3500 } == true
+            } && Parameter.forMode(entry.snapshot.mode).all { it in entry.snapshot.parameters }
+        val nativeOnlyValuesKnown =
+            (VoltraProtocol.bandReadOnlySettings + VoltraProtocol.damperReadOnlySettings)
+                .filter { it in motorRegisters(entry.snapshot.mode) }
+                .all { (entry.configuration[it] ?: -1) >= 0 }
+        val validWeightRange =
+            entry.snapshot.mode != TrainingMode.WEIGHT ||
+                entry.snapshot.parameters[Parameter.WEIGHT]?.let { weight ->
+                    entry.snapshot.parameters[Parameter.ECCENTRIC]?.let { weight + it in entry.snapshot.resistanceLimits.range(Parameter.WEIGHT) }
+                } == true
+        val stateFresh =
+            listOf(entry.statusAt, entry.modeAt).all { it != null && now - it in 0..1500 }
+        val preparationAllowed =
+            !twinPending &&
+                stateFresh &&
+                endpointFresh(entry) &&
+                settingsFresh &&
+                nativeOnlyValuesKnown &&
+                validWeightRange
+        return entry.snapshot.copy(
+            loadControlSupported = true,
+            loadAllowed = preparationAllowed && cableZero,
+            loadPreparationAllowed = preparationAllowed,
+            unloadAllowed = !twinPending && stateFresh && endpointFresh(entry),
+        )
+    }
+
     private fun publish() {
         val snapshots =
             entries.values
                 .map {
+                    val snapshot = motorReadiness(it)
                     if (twinPending)
-                        it.snapshot.copy(
+                        snapshot.copy(
                             activeWeightLb = null,
                             activeWeightSource = null,
                             measuredForceLb = null,
@@ -700,7 +940,7 @@ class DirectVoltraController(
                             cableMoving = null,
                             deviceReps = null,
                         )
-                    else it.snapshot
+                    else snapshot
                 }
                 .toMutableList()
         val pair = nativePair
@@ -715,20 +955,21 @@ class DirectVoltraController(
                         endpoint?.paired == true &&
                         endpoint.peerAddress != EndpointStatus.ZERO_ADDRESS
                 val primary =
-                    controller.snapshot.copy(
-                        twinReported = true,
-                        twinStatusKnown = ready,
-                        twinVerified = ready,
-                        twinRole = TwinRole.CONTROLLER,
-                        activeWeightLb = null,
-                        activeWeightSource = null,
-                        measuredForceLb = null,
-                        cableMoving = null,
-                        runtimeWireWeightLb = null,
-                        resistanceTargetLb = null,
-                        reps = null,
-                        deviceReps = null,
-                    )
+                    motorReadiness(controller)
+                        .copy(
+                            twinReported = true,
+                            twinStatusKnown = ready,
+                            twinVerified = ready,
+                            twinRole = TwinRole.CONTROLLER,
+                            activeWeightLb = null,
+                            activeWeightSource = null,
+                            measuredForceLb = null,
+                            cableMoving = null,
+                            runtimeWireWeightLb = null,
+                            resistanceTargetLb = null,
+                            reps = null,
+                            deviceReps = null,
+                        )
                 val peer =
                     TrainerState(
                         device = pair.peer,
@@ -737,6 +978,10 @@ class DirectVoltraController(
                         mode = primary.mode,
                         modeWireValue = primary.modeWireValue,
                         parameters = primary.parameters,
+                        // Native Twin publishes a logical pair controlled by the primary.
+                        weightUnit = primary.weightUnit,
+                        lengthUnit = primary.lengthUnit,
+                        resistanceLimits = primary.resistanceLimits,
                         batteryPercent = endpoint?.peerBatteryPercent,
                         fitnessMode = primary.fitnessMode,
                         fresh = ready,
@@ -763,6 +1008,22 @@ class DirectVoltraController(
                 twin = logicalPair,
                 twinPending = twinPending,
                 twinSupported = true,
+                trainerTelemetryEpochs =
+                    trainerEpochs.update(
+                        snapshots.associate { trainer ->
+                            val inPair = logicalPair?.let {
+                                trainer.device.id.equals(it.controllerId, true) ||
+                                    trainer.device.id.equals(it.peerId, true)
+                            } == true
+                            trainer.device.id to DirectTelemetrySource(
+                                if (inPair) controller else entries[trainer.device.id],
+                                trainer.telemetrySource(),
+                                logicalPair?.takeIf { inPair }?.let {
+                                    it.controllerId.lowercase() to it.peerId.lowercase()
+                                },
+                            )
+                        }
+                    ),
             )
     }
 

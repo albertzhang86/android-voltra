@@ -11,6 +11,480 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class DirectVoltraControllerTest {
     @Test
+    fun `device limits and units update without changing raw resistance or position units`() = runTest {
+        val rig = Rig(this)
+        rig.link().values[VoltraProtocol.MAX_ALLOWED_FORCE] = 229
+        rig.link().values[VoltraProtocol.WEIGHT_UNIT] = 1
+        rig.link().values[VoltraProtocol.LENGTH_UNIT] = 0
+        rig.ready()
+        assertEquals(229, rig.trainer().resistanceLimits.maximumWeightLb)
+        assertEquals(LimitSource.DEVICE, rig.trainer().resistanceLimits.source)
+        assertEquals(WeightUnit.KILOGRAMS, rig.trainer().weightUnit)
+        assertEquals(LengthUnit.CENTIMETERS, rig.trainer().lengthUnit)
+        rig.controller.setParameter("left", Parameter.ECCENTRIC, 0)
+        rig.controller.setParameter("left", Parameter.WEIGHT, 229)
+        assertEquals(229, rig.trainer().parameters[Parameter.WEIGHT])
+        assertTrue(runCatching { rig.controller.setParameter("left", Parameter.WEIGHT, 230) }.isFailure)
+        assertTrue(rig.link().frames.none { it.contentEquals(VoltraProtocol.write(Parameter.WEIGHT.register, 230, 2)) })
+        rig.link().send(report(VoltraProtocol.WEIGHT_UNIT, 0, 4))
+        rig.link().send(report(VoltraProtocol.LENGTH_UNIT, 1, 4))
+        rig.link().send(report(VoltraProtocol.MAX_ALLOWED_FORCE, 230, 2))
+        runCurrent()
+        assertEquals(WeightUnit.POUNDS, rig.trainer().weightUnit)
+        assertEquals(LengthUnit.INCHES, rig.trainer().lengthUnit)
+        assertEquals(229, rig.trainer().parameters[Parameter.WEIGHT])
+        rig.controller.setParameter("left", Parameter.WEIGHT, 230)
+        rig.link().send(report(VoltraProtocol.WEIGHT_UNIT, 0x100, 4))
+        rig.link().send(report(VoltraProtocol.LENGTH_UNIT, 0x100, 4))
+        rig.link().send(report(VoltraProtocol.MAX_ALLOWED_FORCE, 65535, 2))
+        runCurrent()
+        assertNull(rig.trainer().weightUnit)
+        assertNull(rig.trainer().lengthUnit)
+        assertEquals(ResistanceLimits(), rig.trainer().resistanceLimits)
+        rig.controller.close()
+    }
+
+    @Test
+    fun `firmware 2 uses zero one motor words with checked one shot commands and live telemetry`() = runTest {
+        val rig = Rig(this)
+        rig.link().values[VoltraProtocol.FITNESS] = 0
+        rig.link().values[VoltraProtocol.CABLE_POSITION] = 0
+        rig.link().values[VoltraProtocol.CABLE_OFFSET] = 0
+        rig.ready()
+        assertTrue(rig.trainer().canLoad)
+        assertTrue(rig.link().frames.none { it.size >= 17 && it[10].toInt() == 0x11 && VoltraProtocol.unsigned(it, 13, 2) == VoltraProtocol.FITNESS })
+        rig.controller.setLoaded("left", true)
+        assertEquals(1, rig.trainer().fitnessMode)
+        assertTrue(rig.trainer().loaded)
+        assertEquals(1, rig.link().frames.count { it.contentEquals(VoltraProtocol.write(VoltraProtocol.FITNESS, 1, 2)) })
+        rig.link().send(terseForce(427, targetTenths = 300))
+        runCurrent()
+        assertEquals(30.0, rig.trainer().activeWeightLb!!, 0.001)
+        rig.controller.setLoaded("left", true)
+        assertEquals(1, rig.link().frames.count { it.contentEquals(VoltraProtocol.write(VoltraProtocol.FITNESS, 1, 2)) })
+        rig.controller.setLoaded("left", false)
+        assertEquals(0, rig.trainer().fitnessMode)
+        assertEquals(0.0, rig.trainer().activeWeightLb!!, 0.001)
+        assertNull(rig.trainer().resistanceTargetLb)
+        assertEquals(1, rig.link().frames.count { it.contentEquals(VoltraProtocol.write(VoltraProtocol.FITNESS, 0, 2)) })
+        assertTrue(rig.link().frames.none { it.contentEquals(VoltraProtocol.motorLoad()) || it.contentEquals(VoltraProtocol.motorUnload()) })
+        rig.controller.close()
+    }
+
+    @Test
+    fun `firmware 2 never loads when cable is extended or mode is not selected`() = runTest {
+        for (mode in listOf(0, 1)) {
+            val rig = Rig(this)
+            rig.link().values[VoltraProtocol.FITNESS] = 0
+            rig.link().values[VoltraProtocol.MODE] = mode
+            rig.link().values[VoltraProtocol.CABLE_POSITION] = 2
+            rig.link().values[VoltraProtocol.CABLE_OFFSET] = 0
+            rig.ready()
+            assertTrue(runCatching { rig.controller.setLoaded("left", true) }.isFailure)
+            assertTrue(rig.link().frames.none { it.size >= 17 && it[10].toInt() == 0x11 && VoltraProtocol.unsigned(it, 13, 2) == VoltraProtocol.FITNESS })
+            rig.controller.close()
+        }
+    }
+
+
+    @Test
+    fun `producer revisions retain rapid selected source changes without disturbing another trainer`() = runTest {
+        val rig = Rig(this)
+        rig.ready(2)
+        val original = rig.controller.state.value
+        val leftEpoch = original.telemetryEpochFor("left")
+        val rightEpoch = original.telemetryEpochFor("right")
+        // Both packets are consumed before the caller observes another state snapshot.
+        rig.link().send(report(VoltraProtocol.MODE, 0, 2))
+        rig.link().send(report(VoltraProtocol.MODE, 1, 2))
+        runCurrent()
+        val changed = rig.controller.state.value
+        assertEquals(TrainingMode.WEIGHT, changed.trainers.first().mode)
+        assertTrue(changed.telemetryEpochFor("left") > leftEpoch)
+        assertEquals(rightEpoch, changed.telemetryEpochFor("right"))
+        val modeEpoch = changed.telemetryEpochFor("left")
+        rig.link().send(report(VoltraProtocol.FITNESS, 5, 2))
+        rig.link().send(report(VoltraProtocol.FITNESS, 4, 2))
+        runCurrent()
+        assertEquals(modeEpoch, rig.controller.state.value.telemetryEpochFor("left"))
+        rig.controller.disconnect("left")
+        val removed = rig.controller.state.value.telemetryEpochFor("left")
+        assertTrue(removed > modeEpoch)
+        rig.controller.connect(VoltraDevice("left", "Left"))
+        advanceTimeBy(4_000)
+        runCurrent()
+        assertTrue(rig.controller.state.value.telemetryEpochFor("left") > removed)
+        assertEquals(rightEpoch, rig.controller.state.value.telemetryEpochFor("right"))
+        assertEquals(leftEpoch, original.telemetryEpochFor("left"))
+        rig.controller.close()
+    }
+
+    @Test
+    fun `cancellation as transport returns still closes the link before any protocol writes`() = runTest {
+        val link = FakeLink(LEFT_ADDRESS)
+        var attempts = 0
+        val transport =
+            object : VoltraTransport {
+                override fun scan() = flowOf(emptyList<VoltraDevice>())
+
+                override suspend fun connect(device: VoltraDevice): VoltraLink {
+                    attempts++
+                    currentCoroutineContext().cancel(CancellationException("Connection cancelled"))
+                    return link
+                }
+            }
+        val controller = DirectVoltraController(transport, backgroundScope)
+        controller.connect(VoltraDevice("left", "Left VOLTRA"))
+        runCurrent()
+        assertTrue(link.closed)
+        assertTrue(link.frames.isEmpty())
+        assertEquals(1, attempts)
+        assertFalse(controller.state.value.trainers.single().connected)
+        advanceTimeBy(20_000)
+        runCurrent()
+        assertEquals(1, attempts)
+        assertTrue(link.frames.isEmpty())
+        controller.close()
+    }
+
+    @Test
+    fun `mixed reconnect opens one fresh direct transport after failure without touching knob or motors`() =
+        runTest {
+            val rig = Rig(this)
+            rig.ready()
+            val knobState =
+                MutableStateFlow(
+                    VoltraState(
+                        viaKnob = true,
+                        knob = KnobState(VoltraDevice("knob", "Knob"), ConnectionStatus.READY),
+                        trainers =
+                            listOf(
+                                TrainerState(
+                                    VoltraDevice("knob-owned", "Other VOLTRA"),
+                                    status = ConnectionStatus.READY,
+                                    fresh = true,
+                                    twinStatusKnown = true,
+                                    mode = TrainingMode.WEIGHT,
+                                    modeWireValue = 1,
+                                    fitnessMode = 4,
+                                )
+                            ),
+                    )
+                )
+            val knob =
+                object : VoltraController by rig.controller {
+                    override val state = knobState
+
+                    override suspend fun connect(device: VoltraDevice) =
+                        error("Knob must not reconnect")
+
+                    override fun disconnect(deviceId: String) = error("Knob must stay connected")
+
+                    override fun close() = Unit
+                }
+            val mixed =
+                MixedVoltraController(
+                    rig.controller,
+                    knob,
+                    backgroundScope,
+                    VoltraConnectionRoute.KNOB,
+                )
+            val oldLink = rig.link()
+            oldLink.close()
+            runCurrent()
+            assertEquals(ConnectionStatus.FAILED, rig.trainer().status)
+            val untouchedKnob = knob.state.value
+            mixed.connect(rig.trainer().device)
+            advanceTimeBy(4000)
+            runCurrent()
+            assertEquals(listOf("left", "left"), rig.connectionAttempts)
+            assertNotSame(oldLink, rig.link())
+            assertTrue(rig.trainer().connected && rig.trainer().fresh)
+            assertEquals(untouchedKnob, knob.state.value)
+            assertTrue(mixed.state.value.viaKnob)
+            assertEquals(VoltraConnectionRoute.DIRECT, mixed.state.value.routeFor("left"))
+            assertFalse(
+                rig.link().frames.any {
+                    it.contentEquals(VoltraProtocol.motorLoad()) ||
+                        it.contentEquals(VoltraProtocol.motorUnload()) ||
+                        it[10].toInt() and 255 == VoltraProtocol.TWIN_COMMAND
+                }
+            )
+            advanceTimeBy(5000)
+            runCurrent()
+            assertEquals(2, rig.connectionAttempts.size)
+            mixed.close()
+        }
+
+    @Test
+    fun `loading rereads the complete Band configuration and rejects a changed native-only field`() =
+        runTest {
+            val rig = Rig(this)
+            rig.link().values[VoltraProtocol.MODE] = TrainingMode.BAND.wireValue
+            rig.link().values[Parameter.BAND_MAXIMUM.register] = 50
+            rig.link().values[VoltraProtocol.CABLE_POSITION] = 0
+            rig.link().values[VoltraProtocol.CABLE_OFFSET] = 0
+            VoltraProtocol.bandReadOnlySettings.forEach { rig.link().values[it] = 0 }
+            rig.ready()
+            assertTrue(rig.trainer().canLoad)
+            rig.link().onSetup = { rig.link().values[0x53b7] = 100 }
+            assertTrue(runCatching { rig.controller.setLoaded("left", true) }.isFailure)
+            assertFalse(rig.link().frames.any { it.contentEquals(VoltraProtocol.motorLoad()) })
+            rig.controller.close()
+        }
+
+    @Test
+    fun `missing post-setup setting readback prevents GO despite previous ready configuration`() =
+        runTest {
+            val rig = Rig(this)
+            rig.link().values[VoltraProtocol.CABLE_POSITION] = 0
+            rig.link().values[VoltraProtocol.CABLE_OFFSET] = 0
+            rig.ready()
+            assertTrue(rig.trainer().canLoad)
+            rig.link().onSetup = { rig.link().values.remove(Parameter.CHAINS.register) }
+            assertTrue(runCatching { rig.controller.setLoaded("left", true) }.isFailure)
+            assertFalse(rig.link().frames.any { it.contentEquals(VoltraProtocol.motorLoad()) })
+            rig.controller.close()
+        }
+
+    @Test
+    fun `changed configured resistance during setup prevents GO`() = runTest {
+        val rig = Rig(this)
+        rig.link().values[VoltraProtocol.CABLE_POSITION] = 0
+        rig.link().values[VoltraProtocol.CABLE_OFFSET] = 0
+        rig.ready()
+        rig.link().onSetup = { rig.link().values[Parameter.WEIGHT.register] = 100 }
+        assertTrue(runCatching { rig.controller.setLoaded("left", true) }.isFailure)
+        assertFalse(rig.link().frames.any { it.contentEquals(VoltraProtocol.motorLoad()) })
+        rig.controller.close()
+    }
+
+    @Test
+    fun `known armed statuses may unload but unknown loaded flags never authorize motor changes`() =
+        runTest {
+            for (fitness in listOf(0x26, 0x27, 0x105, 0x204)) {
+                val rig = Rig(this)
+                rig.link().values[VoltraProtocol.FITNESS] = fitness
+                rig.ready()
+                if (fitness in listOf(0x26, 0x27)) {
+                    assertTrue(rig.trainer().canUnload)
+                    rig.controller.setLoaded("left", false)
+                    assertTrue(rig.trainer().unloaded)
+                    assertEquals(
+                        1,
+                        rig.link().frames.count { it.contentEquals(VoltraProtocol.motorUnload()) },
+                    )
+                } else {
+                    assertFalse(rig.trainer().canLoad)
+                    assertFalse(rig.trainer().canUnload)
+                    assertTrue(runCatching { rig.controller.setLoaded("left", true) }.isFailure)
+                    assertTrue(runCatching { rig.controller.setLoaded("left", false) }.isFailure)
+                    assertFalse(
+                        rig.link().frames.any {
+                            it.contentEquals(VoltraProtocol.motorLoad()) ||
+                                it.contentEquals(VoltraProtocol.motorUnload())
+                        }
+                    )
+                }
+                rig.controller.close()
+            }
+        }
+
+    @Test
+    fun `caller cancellation or endpoint change during setup cannot send GO`() = runTest {
+        for (changeEndpoint in listOf(false, true)) {
+            val rig = Rig(this)
+            rig.link().values[VoltraProtocol.CABLE_POSITION] = 0
+            rig.link().values[VoltraProtocol.CABLE_OFFSET] = 0
+            rig.ready()
+            if (changeEndpoint) {
+                rig.link().onSetup = {
+                    rig.link().send(endpointReport(LEFT_ADDRESS, RIGHT_ADDRESS))
+                }
+                assertTrue(runCatching { rig.controller.setLoaded("left", true) }.isFailure)
+            } else {
+                rig.link().onSetup = { rig.link().respond = false }
+                val load = async { rig.controller.setLoaded("left", true) }
+                runCurrent()
+                assertTrue(rig.link().frames.any { it.contentEquals(VoltraProtocol.motorSetup()) })
+                load.cancelAndJoin()
+                rig.link().respond = true
+                rig.link().send(report(VoltraProtocol.CABLE_POSITION, 0, 2))
+                rig.link().send(report(VoltraProtocol.CABLE_OFFSET, 0, 2))
+                advanceTimeBy(1200)
+                runCurrent()
+                assertTrue(load.isCancelled)
+            }
+            assertFalse(rig.link().frames.any { it.contentEquals(VoltraProtocol.motorLoad()) })
+            assertFalse(rig.trainer().pending)
+            rig.controller.close()
+        }
+    }
+
+    @Test
+    fun `missing or negative saved offset cannot authorize load`() = runTest {
+        for (offset in listOf<Int?>(null, -1, 0xffff)) {
+            val rig = Rig(this)
+            rig.link().values[VoltraProtocol.CABLE_POSITION] = 0
+            offset?.let { rig.link().values[VoltraProtocol.CABLE_OFFSET] = it }
+            rig.ready()
+            assertFalse(rig.trainer().canLoad)
+            assertTrue(runCatching { rig.controller.setLoaded("left", true) }.isFailure)
+            assertFalse(rig.link().frames.any { it.contentEquals(VoltraProtocol.motorLoad()) })
+            rig.controller.close()
+        }
+    }
+
+    @Test
+    fun `direct motor load verifies setup then confirms a single GO and STOP`() = runTest {
+        val rig = Rig(this)
+        rig.link().values[VoltraProtocol.CABLE_POSITION] = 0
+        rig.link().values[VoltraProtocol.CABLE_OFFSET] = 0
+        rig.ready()
+        assertTrue(rig.trainer().canLoad)
+        rig.controller.setLoaded("left", true)
+        assertTrue(rig.trainer().loaded)
+        val loads = rig.link().frames.count { it.contentEquals(VoltraProtocol.motorLoad()) }
+        assertEquals(1, loads)
+        assertEquals(1, rig.link().frames.count { it.contentEquals(VoltraProtocol.motorSetup()) })
+        rig.controller.setLoaded("left", true)
+        assertEquals(
+            loads,
+            rig.link().frames.count { it.contentEquals(VoltraProtocol.motorLoad()) },
+        )
+        rig.controller.setLoaded("left", false)
+        assertTrue(rig.trainer().unloaded)
+        assertEquals(1, rig.link().frames.count { it.contentEquals(VoltraProtocol.motorUnload()) })
+        rig.controller.close()
+    }
+
+    @Test
+    fun `load preparation refreshes missing or expired cable evidence before one GO`() = runTest {
+        for (expired in listOf(false, true)) {
+            val rig = Rig(this)
+            if (expired) {
+                rig.link().values[VoltraProtocol.CABLE_POSITION] = 0
+                rig.link().values[VoltraProtocol.CABLE_OFFSET] = 0
+            }
+            rig.ready()
+            if (expired) {
+                rig.link().values.remove(VoltraProtocol.CABLE_POSITION)
+                rig.link().values.remove(VoltraProtocol.CABLE_OFFSET)
+                advanceTimeBy(1800)
+                runCurrent()
+            }
+            assertFalse(rig.trainer().canLoad)
+            assertTrue(rig.trainer().canPrepareLoad)
+            rig.link().onSetup = {
+                rig.link().values[VoltraProtocol.CABLE_POSITION] = 0
+                rig.link().values[VoltraProtocol.CABLE_OFFSET] = 0
+            }
+            rig.controller.setLoaded("left", true)
+            assertTrue(rig.trainer().loaded)
+            assertEquals(1, rig.link().frames.count { it.contentEquals(VoltraProtocol.motorSetup()) })
+            assertEquals(1, rig.link().frames.count { it.contentEquals(VoltraProtocol.motorLoad()) })
+            rig.controller.close()
+        }
+    }
+
+    @Test
+    fun `captured two centimeter SETUP blocks Single and Twin without force or calibration writes`() = runTest {
+        for (twin in listOf(false, true)) {
+            val rig = Rig(this)
+            if (twin) rig.link().peerAddress = RIGHT_ADDRESS
+            rig.ready()
+            // Real VTR-161230 query and SETUP replies, 2026-10-17. No generated
+            // cable replies are configured in the transport for this case.
+            rig.link().send(VoltraProtocol.hex(
+                "551b08d610aa002020000f000300823e02006a5000001150008a5b"
+            ))
+            runCurrent()
+            assertEquals(twin, rig.controller.state.value.twin != null)
+            assertTrue(rig.trainer().canPrepareLoad)
+            assertFalse(rig.trainer().canLoad)
+            rig.link().onSetup = {
+                rig.link().send(VoltraProtocol.hex(
+                    "5518088310aa150020000f0002006a500000823e02000946"
+                ))
+            }
+            val before = rig.link().frames.size
+            val failure = runCatching { rig.controller.setLoaded("left", true) }.exceptionOrNull()
+            assertNotNull(failure)
+            assertTrue(failure!!.message!!.contains("zero position"))
+            assertTrue(rig.trainer().unloaded)
+            assertFalse(rig.trainer().pending)
+            advanceTimeBy(5_000)
+            runCurrent()
+            val attempted = rig.link().frames.drop(before)
+            assertEquals(1, attempted.count { it.contentEquals(VoltraProtocol.motorSetup()) })
+            // Status polls are allowed; motor/offset writes and vendor guided
+            // load triggers are not fallback actions after an explicit block.
+            assertTrue(attempted.all { (it[10].toInt() and 255) in listOf(0x0f, VoltraProtocol.ENDPOINT_STATUS) })
+            assertFalse(rig.trainer().loaded)
+            rig.controller.close()
+        }
+    }
+
+    @Test
+    fun `nonzero missing malformed and stale cable readings cannot authorize direct loading`() =
+        runTest {
+            for (position in listOf<Int?>(null, 2, 100, -1, 32767)) {
+                val rig = Rig(this)
+                position?.let { rig.link().values[VoltraProtocol.CABLE_POSITION] = it }
+                rig.link().values[VoltraProtocol.CABLE_OFFSET] = 0
+                rig.ready()
+                assertFalse(rig.trainer().canLoad)
+                assertTrue(runCatching { rig.controller.setLoaded("left", true) }.isFailure)
+                assertFalse(rig.link().frames.any { it.contentEquals(VoltraProtocol.motorLoad()) })
+                rig.controller.close()
+            }
+            val rig = Rig(this)
+            rig.link().values[VoltraProtocol.CABLE_POSITION] = 0
+            rig.link().values[VoltraProtocol.CABLE_OFFSET] = 0
+            rig.ready()
+            rig.link().values.remove(VoltraProtocol.CABLE_POSITION)
+            advanceTimeBy(1800)
+            runCurrent()
+            assertTrue(rig.trainer().fresh)
+            assertFalse(rig.trainer().canLoad)
+            assertTrue(runCatching { rig.controller.setLoaded("left", true) }.isFailure)
+            assertFalse(rig.link().frames.any { it.contentEquals(VoltraProtocol.motorLoad()) })
+            rig.controller.close()
+        }
+
+    @Test
+    fun `cable moving during setup prevents GO and missing confirmation never resends`() = runTest {
+        val rig = Rig(this)
+        rig.link().values[VoltraProtocol.CABLE_POSITION] = 0
+        rig.link().values[VoltraProtocol.CABLE_OFFSET] = 0
+        rig.ready()
+        rig.link().onSetup = { rig.link().values[VoltraProtocol.CABLE_POSITION] = 10 }
+        assertTrue(runCatching { rig.controller.setLoaded("left", true) }.isFailure)
+        assertFalse(rig.link().frames.any { it.contentEquals(VoltraProtocol.motorLoad()) })
+        rig.link().onSetup = {}
+        rig.link().values[VoltraProtocol.CABLE_POSITION] = 0
+        advanceTimeBy(1000)
+        runCurrent()
+        rig.link().acceptSettings = false
+        assertTrue(runCatching { rig.controller.setLoaded("left", true) }.isFailure)
+        assertEquals(1, rig.link().frames.count { it.contentEquals(VoltraProtocol.motorLoad()) })
+        assertFalse(rig.trainer().loaded)
+        rig.controller.close()
+    }
+
+    @Test
+    fun `mode change during cable setup invalidates motor admission`() = runTest {
+        val rig = Rig(this)
+        rig.link().values[VoltraProtocol.CABLE_POSITION] = 0
+        rig.link().values[VoltraProtocol.CABLE_OFFSET] = 0
+        rig.ready()
+        rig.link().onSetup = { rig.link().send(report(VoltraProtocol.MODE, 2, 1)) }
+        assertTrue(runCatching { rig.controller.setLoaded("left", true) }.isFailure)
+        assertFalse(rig.link().frames.any { it.contentEquals(VoltraProtocol.motorLoad()) })
+        rig.controller.close()
+    }
+
+    @Test
     fun `live motion requires loaded same-sample force and signed velocity in all four modes`() =
         runTest {
             for (mode in TrainingMode.entries) {
@@ -209,7 +683,7 @@ class DirectVoltraControllerTest {
             rig.link().send(terseForce(200, targetTenths = 300))
             runCurrent()
             assertEquals(30.0, rig.trainer().activeWeightLb!!, 0.001)
-            for (unknown in listOf(0, 6, 65535)) {
+            for (unknown in listOf(2, 6, 65535)) {
                 rig.link().send(report(VoltraProtocol.FITNESS, unknown, 2))
                 rig.link().send(terseForce(11, targetTenths = 300))
                 runCurrent()
@@ -566,13 +1040,14 @@ class DirectVoltraControllerTest {
 
     @Test
     fun `idle trainer can select a mode independently of a connected weight trainer`() = runTest {
-        for (fitness in listOf(0, 4)) {
+        for (fitness in listOf(0, 4, 0x0104)) {
             val rig = Rig(this)
             rig.link().values[VoltraProtocol.MODE] = 0
             rig.link().values[VoltraProtocol.FITNESS] = fitness
             rig.ready(2)
             assertNull(rig.trainer().mode)
             assertEquals(0, rig.trainer().modeWireValue)
+            assertEquals(fitness, rig.trainer().fitnessMode)
             assertTrue(rig.trainer().parameters.isEmpty())
             assertTrue(rig.trainer().canChangeMode)
             assertEquals(TrainingMode.WEIGHT, rig.trainer("right").mode)
@@ -584,6 +1059,13 @@ class DirectVoltraControllerTest {
             selection.await()
             assertEquals(TrainingMode.BAND, rig.trainer().mode)
             assertEquals(TrainingMode.BAND.wireValue, rig.trainer().modeWireValue)
+            assertTrue(rig.trainer().modeConfirmed)
+            assertEquals(fitness, rig.trainer().fitnessMode)
+            if (fitness == 0) {
+                assertFalse(rig.trainer().canLoad)
+                assertFalse(rig.trainer().canPrepareLoad)
+                assertFalse(rig.trainer().loaded)
+            }
             assertFalse(rig.trainer().pending)
             assertEquals(TrainingMode.WEIGHT, rig.trainer("right").mode)
             assertTrue(
@@ -597,7 +1079,7 @@ class DirectVoltraControllerTest {
 
     @Test
     fun `unsupported mode remains read only even with idle fitness status`() = runTest {
-        for (fitness in listOf(0, 4)) {
+        for (fitness in listOf(0, 4, 0x0104)) {
             val rig = Rig(this)
             rig.link().values[VoltraProtocol.MODE] = 99
             rig.link().values[VoltraProtocol.FITNESS] = fitness
@@ -616,7 +1098,7 @@ class DirectVoltraControllerTest {
 
     @Test
     fun `idle mode cannot bypass loaded or armed fitness status`() = runTest {
-        for (fitness in listOf(5, 21, 0x26, 0x27)) {
+        for (fitness in listOf(5, 21, 0x26, 0x27, 0x0204, 0xff04, 0x0105, 0x0126)) {
             val rig = Rig(this)
             rig.link().values[VoltraProtocol.MODE] = 0
             rig.link().values[VoltraProtocol.FITNESS] = fitness
@@ -630,6 +1112,51 @@ class DirectVoltraControllerTest {
             rig.controller.close()
         }
     }
+
+    @Test
+    fun `flagged ready transition clears loaded telemetry and permits a confirmed mode change`() =
+        runTest {
+            val rig = Rig(this)
+            rig.link().values[VoltraProtocol.FITNESS] = 5
+            rig.ready()
+            rig.link().send(terseForce(210, targetTenths = 300, velocityMmPerSecond = 100))
+            runCurrent()
+            assertEquals(true, rig.trainer().cableMoving)
+            rig.link().values[VoltraProtocol.FITNESS] = 0x0104
+            rig.link().send(report(VoltraProtocol.FITNESS, 0x0104, 2))
+            runCurrent()
+            assertEquals(0x0104, rig.trainer().fitnessMode)
+            assertTrue(rig.trainer().unloaded)
+            assertTrue(rig.trainer().canChangeMode)
+            assertTrue(rig.trainer().canEdit(Parameter.WEIGHT))
+            assertEquals(0.0, rig.trainer().activeWeightLb!!, 0.001)
+            assertEquals(ActiveWeightSource.UNLOADED, rig.trainer().activeWeightSource)
+            assertNull(rig.trainer().resistanceTargetLb)
+            assertNull(rig.trainer().measuredForceLb)
+            assertNull(rig.trainer().cableMoving)
+            val selection = async { rig.controller.setMode("left", TrainingMode.BAND) }
+            advanceTimeBy(250)
+            runCurrent()
+            selection.await()
+            assertEquals(TrainingMode.BAND, rig.trainer().mode)
+            assertEquals(0x0104, rig.trainer().fitnessMode)
+            assertFalse(rig.trainer().pending)
+            rig.link().values[VoltraProtocol.FITNESS] = 0x0204
+            rig.link().send(report(VoltraProtocol.FITNESS, 0x0204, 2))
+            runCurrent()
+            assertFalse(rig.trainer().unloaded)
+            assertNull(rig.trainer().activeWeightLb)
+            val priorModeWrites =
+                rig.link().writes.count { it.command == 0x11 && it.register == VoltraProtocol.MODE }
+            assertTrue(
+                runCatching { rig.controller.setMode("left", TrainingMode.WEIGHT) }.isFailure
+            )
+            assertEquals(
+                priorModeWrites,
+                rig.link().writes.count { it.command == 0x11 && it.register == VoltraProtocol.MODE },
+            )
+            rig.controller.close()
+        }
 
     @Test
     fun `idle mode needs both mode readback and known topology`() = runTest {
@@ -979,12 +1506,16 @@ private class FakeLink(val address: String) : VoltraLink {
             Parameter.INVERSE_CHAINS.register to 0,
         )
     val writes = mutableListOf<Write>()
+    val frames = mutableListOf<ByteArray>()
+    var onSetup: () -> Unit = {}
     var respond = true
     var acceptSettings = true
     var closed = false
 
     override suspend fun write(frame: ByteArray) {
         check(!closed)
+        frames += frame.copyOf()
+        if (frame.contentEquals(VoltraProtocol.motorSetup())) onSetup()
         val command = frame[10].toInt() and 255
         val register = if (frame.size >= 17) VoltraProtocol.unsigned(frame, 13, 2) else 0
         writes += Write(command, register)
@@ -1016,18 +1547,31 @@ private class FakeLink(val address: String) : VoltraLink {
             )
             if (operation == 1 && applyTwin) close()
         }
-        if (command == 0x0f && respond)
-            values[register]?.let { value ->
-                val width =
-                    Parameter.entries.find { it.register == register }?.width
-                        ?: if (
-                            register in
-                                listOf(VoltraProtocol.FITNESS, VoltraProtocol.RUNTIME_WIRE_WEIGHT)
-                        )
-                            2
-                        else 1
-                send(report(register, value, width))
+        if (command == 0x0f && respond) {
+            val registers =
+                (0 until (frame[11].toInt() and 255)).map {
+                    VoltraProtocol.unsigned(frame, 13 + it * 2, 2)
+                }
+            registers.forEach { register ->
+                values[register]?.let { value ->
+                    val width =
+                        Parameter.entries.find { it.register == register }?.width
+                            ?: if (
+                                register in
+                                    listOf(
+                                        VoltraProtocol.MAX_ALLOWED_FORCE,
+                                        VoltraProtocol.FITNESS,
+                                        VoltraProtocol.RUNTIME_WIRE_WEIGHT,
+                                        VoltraProtocol.CABLE_POSITION,
+                                        VoltraProtocol.CABLE_OFFSET,
+                                    )
+                            )
+                                2
+                            else 1
+                    send(report(register, value, width))
+                }
             }
+        }
     }
 
     fun send(frame: ByteArray) {

@@ -1,6 +1,7 @@
 package io.github.albertzhang86.voltra.protocol
 
 import io.github.albertzhang86.voltra.Parameter
+import io.github.albertzhang86.voltra.MotorState
 
 /** Protocol references and their pinned revisions are listed in THIRD_PARTY.md. */
 object VoltraProtocol {
@@ -8,8 +9,18 @@ object VoltraProtocol {
     const val FITNESS = 0x3e89
     const val BATTERY = 0x4e2d
     const val WEIGHT_UNIT = 0x506e
+    const val LENGTH_UNIT = 0x506f
+    /** Device-enforced current allowed force, not an Overdrive enable setting. Read only. */
+    const val MAX_ALLOWED_FORCE = 0x5314
     /** Signed 16-bit runtime wire weight in whole pounds, separate from the base-weight setting. */
     const val RUNTIME_WIRE_WEIGHT = 0x3e83
+    const val CABLE_POSITION = 0x3e82
+    const val CABLE_OFFSET = 0x506a
+    /** APP_CUR_SCR_ID, a one-byte enum included with the trainer's cable-position replies. */
+    const val SCREEN = 0x5011
+    // Existing read-only mode catalogue. These controls are not exposed as writable settings.
+    internal val bandReadOnlySettings = setOf(0x53b7, 0x53b6, 0x5361, 0x52e3)
+    internal val damperReadOnlySettings = setOf(0x5106)
     const val TWIN_STATUS = 0x516c
     const val ENDPOINT_STATUS = 0xa7
     const val TWIN_COMMAND = 0xa8
@@ -52,6 +63,22 @@ object VoltraProtocol {
     }
 
     fun subscribe() = hex("551504a9aa10012020001101008351ffffffff35eb")
+
+    // Existing trainer load sequence; setup reads both cable registers and never changes offset.
+    fun motorSetup() = hex("55130403aa10150020000f02006a50823e8f2f")
+
+    fun motorLoad() = hex("55130403aa1016002000110100893e05008173")
+
+    fun motorUnload() = hex("55130403aa101b002000110100893e040037dd")
+
+    internal fun motorCommand(reportedState: Int?, load: Boolean): ByteArray =
+        when (val value = requireNotNull(MotorState.commandValue(reportedState, load)) {
+            "Unrecognized VOLTRA motor state."
+        }) {
+            5 -> motorLoad()
+            4 -> motorUnload()
+            else -> write(FITNESS, value, 2)
+        }
 
     fun endpointStatus() = envelope(ENDPOINT_STATUS, byteArrayOf())
 
@@ -203,25 +230,51 @@ object VoltraDecoder {
             val id = VoltraProtocol.unsigned(frame, offset, 2)
             offset += 2
             val parameter = Parameter.entries.find { it.register == id }
+            val readOnlyModeField =
+                id in VoltraProtocol.bandReadOnlySettings ||
+                    id in VoltraProtocol.damperReadOnlySettings
+            // The native catalogue uses isolated replies; do not guess widths in a mixed record.
+            if (readOnlyModeField && count != 1) return null
             val expected =
-                parameter?.width
+                (if (readOnlyModeField) 2 else null)
+                    ?: parameter?.width
                     ?: when (id) {
+                        VoltraProtocol.MAX_ALLOWED_FORCE,
                         VoltraProtocol.FITNESS,
+                        VoltraProtocol.CABLE_POSITION,
+                        VoltraProtocol.CABLE_OFFSET,
                         VoltraProtocol.RUNTIME_WIRE_WEIGHT -> 2
-                        VoltraProtocol.WEIGHT_UNIT -> 4
+                        VoltraProtocol.WEIGHT_UNIT, VoltraProtocol.LENGTH_UNIT -> 4
                         VoltraProtocol.MODE,
+                        VoltraProtocol.SCREEN,
                         VoltraProtocol.BATTERY,
                         VoltraProtocol.TWIN_STATUS -> 1
+                        // Known one-byte widths, unknown semantics. Firmware 2.0 includes
+                        // these in the settings cascade before/after MODE. Never write them.
+                        0x5102, 0x4ee1, 0x5124 -> 1
                         else -> return null
                     }
             // Isolated replies carry their actual width; firmware revisions vary for enum
             // registers.
             val width = if (count == 1) frame.size - 2 - offset else expected
             if (width !in listOf(1, 2, 4) || offset + width > frame.size - 2) return null
-            if (id == VoltraProtocol.RUNTIME_WIRE_WEIGHT && width != 2) return null
+            if (
+                id in
+                    listOf(
+                        VoltraProtocol.MAX_ALLOWED_FORCE,
+                        VoltraProtocol.RUNTIME_WIRE_WEIGHT,
+                        VoltraProtocol.CABLE_POSITION,
+                        VoltraProtocol.CABLE_OFFSET,
+                    ) && width != 2
+            )
+                return null
             val value = VoltraProtocol.unsigned(frame, offset, width)
             values[id] =
-                if (id == Parameter.ECCENTRIC.register || id == VoltraProtocol.RUNTIME_WIRE_WEIGHT)
+                if (
+                    id == Parameter.ECCENTRIC.register ||
+                        id == VoltraProtocol.RUNTIME_WIRE_WEIGHT ||
+                        id == VoltraProtocol.CABLE_POSITION
+                )
                     value.toShort().toInt()
                 else value
             offset += width

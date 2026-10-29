@@ -1,6 +1,8 @@
 package io.github.albertzhang86.voltra
 
 import java.util.Locale
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
@@ -20,22 +22,30 @@ class MixedVoltraController(
     parentScope: CoroutineScope,
     initialRoute: VoltraConnectionRoute = VoltraConnectionRoute.DIRECT,
 ) : VoltraController {
+    override fun beginSetupActivity(activity: SetupActivity): AutoCloseable =
+        knob?.beginSetupActivity(activity) ?: AutoCloseable {}
+
     private val job = SupervisorJob(parentScope.coroutineContext[Job])
     private val scope = CoroutineScope(parentScope.coroutineContext + job)
     private val discoveryRoute = MutableStateFlow(initialRoute)
     private val connections = Mutex()
     private val topology = Mutex()
     private var topologyOperation: Job? = null
+    private var manualPreparation: ManualPreparation? = null
+    private var manualPreparationJob: Job? = null
+    private var activeControlCommands = 0
     private var topologyPending = false
     private var localExitRestoreQueued = false
     private var handoff: Handoff? = null
     private var recoveryBlocked = false
+    private var reconnectingRecovery: Handoff? = null
     private var lastOfferedPeer: VoltraDevice? = null
     private var lastHandledKnobRequest: KnobTwinRequest? = null
     private val knownKnobs = mutableSetOf<String>()
     private var closed = false
     private var telemetryEpoch = 0L
     private var continuity: Continuity? = null
+    private val trainerEpochs = TrainerTelemetryEpochs<MixedTelemetrySource>()
     private val mutableState = MutableStateFlow(VoltraState())
 
     /** Reads current child snapshots even before their flow collectors have been scheduled. */
@@ -86,7 +96,8 @@ class MixedVoltraController(
                                     ?.device
                                     .takeIf { current.hasMixedConnections })
                             .takeIf { current.knob?.mixedTwinHandoffSupported == true }
-                    val ready = peer != null && (retained != null || current.canCreateTwin)
+                    val ready =
+                        peer != null && (retained != null || current.canCreateTwinAfterUnloading)
                     lastOfferedPeer = peer.takeIf { ready }
                     try {
                         bridge.offerTwinPeer(peer, ready)
@@ -154,27 +165,91 @@ class MixedVoltraController(
     override suspend fun connect(device: VoltraDevice) =
         connections.withLock {
             checkOpen()
+            currentCoroutineContext().ensureActive()
             val current = refresh()
+            val recovery = handoff.takeIf { recoveryBlocked }
+            if (recovery != null && device.id.equals(recovery.knobId, ignoreCase = true)) {
+                // Reconnecting the exact bridge is how an uncertain native outcome is read back.
+                // Keep all control blocked until its new session confirms the original topology.
+                check(current.recoverableKnobId.equals(device.id, ignoreCase = true)) {
+                    "Wait for the knob or Twin connection change to finish."
+                }
+                val bridge = requireNotNull(knob)
+                val target =
+                    bridge.state.value.knob?.device
+                        ?.takeIf { it.id.equals(recovery.knobId, ignoreCase = true) }
+                        ?: device.copy(id = recovery.knobId)
+                bridge.disconnect(recovery.knobId)
+                reconnectingRecovery = recovery
+                try {
+                    currentCoroutineContext().ensureActive()
+                    checkOpen()
+                    bridge.connect(target)
+                } catch (failure: Exception) {
+                    reconnectingRecovery = null
+                    throw failure
+                } finally {
+                    refresh()
+                }
+                return@withLock
+            }
             check(current.connectionError == null) { requireNotNull(current.connectionError) }
-            val route =
-                if (device.id.identity() in knownKnobs) VoltraConnectionRoute.KNOB
-                else discoveryRoute.value
             check(current.twin == null && !current.twinPending) {
                 "Exit Twin mode before connecting another trainer."
             }
             val occupied = owners(device.id)
-            check(occupied.isEmpty()) {
-                "This trainer is already connected. Disconnect its current route first."
-            }
+            check(occupied.size <= 1) { "This trainer has more than one connection owner." }
+            val existing = occupied.singleOrNull()
+            val retry =
+                existing?.let { owner ->
+                    val trainer =
+                        owner.controller.state.value.trainers.single {
+                            it.device.id.equals(owner.deviceId, true)
+                        }
+                    check(
+                        owner.route == VoltraConnectionRoute.DIRECT &&
+                            trainer.status in
+                                setOf(ConnectionStatus.FAILED, ConnectionStatus.DISCONNECTED) &&
+                            !trainer.pending &&
+                            !trainer.twinReported
+                    ) {
+                        "This trainer is already connected. Disconnect its current route first."
+                    }
+                    trainer.device
+                }
+            // An offline row still owns its exact device identity. Reconnect on that route,
+            // even if discovery currently shows knobs; never send a trainer MAC to the bridge.
+            val route =
+                existing?.route
+                    ?: if (device.id.identity() in knownKnobs) VoltraConnectionRoute.KNOB
+                    else discoveryRoute.value
             if (route == VoltraConnectionRoute.DIRECT) {
-                check(current.trainers.size < 2) { "Disconnect a trainer before adding another." }
+                check(current.trainers.size - (if (retry != null) 1 else 0) < 2) {
+                    "Disconnect a trainer before adding another."
+                }
             } else {
                 check(direct.state.value.trainers.size < 2) {
                     "Disconnect a direct trainer before connecting the knob."
                 }
             }
             try {
-                controller(route).connect(device)
+                if (retry != null) {
+                    // The failed child entry retains a closed GATT and blocks a fresh attempt.
+                    // Removing it never unloads, changes Twin, or replays a previous command.
+                    direct.disconnect(retry.id)
+                    currentCoroutineContext().ensureActive()
+                    checkOpen()
+                    val latest = refresh()
+                    check(
+                        latest.connectionError == null &&
+                            latest.twin == null &&
+                            !latest.twinPending &&
+                            owners(retry.id).isEmpty()
+                    ) {
+                        "Trainer ownership changed before reconnecting."
+                    }
+                }
+                controller(route).connect(retry ?: device)
             } finally {
                 refresh()
             }
@@ -182,13 +257,17 @@ class MixedVoltraController(
 
     override fun disconnect(deviceId: String) {
         checkOpen()
-        check(!topologyPending) { "Wait for the Twin connection change to finish." }
+        check(!topologyPending && manualPreparation == null) {
+            "Wait for the Twin connection change to finish."
+        }
         val owner = lifecycleOwner(deviceId) ?: return
         try {
             owner.controller.disconnect(owner.deviceId)
             if (owner.route == VoltraConnectionRoute.KNOB) {
-                recoveryBlocked = false
-                handoff = null
+                reconnectingRecovery = null
+                // Cancel closes the attempted bridge session, not an uncertain native outcome.
+                // Keep the original recovery target until a later reconnect verifies topology.
+                if (!recoveryBlocked) handoff = null
             }
         } finally {
             refresh()
@@ -197,7 +276,9 @@ class MixedVoltraController(
 
     override fun forget(deviceId: String) {
         checkOpen()
-        check(!topologyPending) { "Wait for the Twin connection change to finish." }
+        check(!topologyPending && manualPreparation == null) {
+            "Wait for the Twin connection change to finish."
+        }
         val owner =
             lifecycleOwner(deviceId)
                 ?: if (deviceId.identity() in knownKnobs && knob != null)
@@ -208,6 +289,7 @@ class MixedVoltraController(
             if (owner.route == VoltraConnectionRoute.KNOB) {
                 knownKnobs -= deviceId.identity()
                 recoveryBlocked = false
+                reconnectingRecovery = null
                 handoff = null
             }
         } finally {
@@ -215,20 +297,77 @@ class MixedVoltraController(
         }
     }
 
-    override suspend fun setMode(deviceId: String, mode: TrainingMode) {
+    override suspend fun setMode(deviceId: String, mode: TrainingMode) = controlCommand {
         val owner = commandOwner(deviceId)
-        try {
-            owner.controller.setMode(owner.deviceId, mode)
-        } finally {
-            refresh()
-        }
+        owner.controller.setMode(owner.deviceId, mode)
     }
 
-    override suspend fun setParameter(deviceId: String, parameter: Parameter, value: Int) {
-        val owner = commandOwner(deviceId)
-        try {
+    override suspend fun setParameter(deviceId: String, parameter: Parameter, value: Int) =
+        controlCommand {
+            val owner = commandOwner(deviceId)
             owner.controller.setParameter(owner.deviceId, parameter, value)
+        }
+
+    override suspend fun setLoaded(deviceId: String, loaded: Boolean) = controlCommand {
+        val owner = commandOwner(deviceId)
+        owner.controller.setLoaded(owner.deviceId, loaded)
+    }
+
+    override suspend fun createTwinAfterUnloading(
+        controllerId: String,
+        peerId: String,
+        stillRelevant: () -> Boolean,
+    ) = manualTwinChange { internalController ->
+        prepareTwinChange(internalController, controllerId, peerId, true, stillRelevant)
+    }
+
+    override suspend fun exitTwinAfterUnloading(stillRelevant: () -> Boolean) =
+        manualTwinChange { internalController ->
+            prepareTwinChange(internalController, null, null, false, stillRelevant)
+        }
+
+    /** Keep one explicit owner from the first STOP through confirmed native topology. */
+    private suspend fun manualTwinChange(action: suspend (VoltraController) -> Unit) =
+        coroutineScope {
+            checkOpen()
+            check(manualPreparation == null && activeControlCommands == 0) {
+                "Wait for the current trainer operation before changing Twin."
+            }
+            check(!refresh().twinPending) { "Wait for the current Twin connection change." }
+            val owner = ManualPreparation()
+            manualPreparation = owner
+            manualPreparationJob = currentCoroutineContext().job
+            refresh()
+            try {
+                withContext(owner) {
+                    // Only the shared helper may read through our reservation. Child pending,
+                    // freshness and native topology guards remain unchanged. This internal view
+                    // is never published to observers or used by unrelated command callers.
+                    val internalController =
+                        object : VoltraController by this@MixedVoltraController {
+                            override val state: StateFlow<VoltraState> =
+                                object :
+                                    StateFlow<VoltraState> by this@MixedVoltraController.state {
+                                    override val value: VoltraState
+                                        get() = preparationSnapshot()
+                                }
+                        }
+                    action(internalController)
+                }
+            } finally {
+                manualPreparation = null
+                manualPreparationJob = null
+                refresh()
+            }
+        }
+
+    private suspend fun controlCommand(action: suspend () -> Unit) {
+        commandSnapshot() // Reject unrelated work before it can reach either transport.
+        activeControlCommands++
+        try {
+            action()
         } finally {
+            activeControlCommands--
             refresh()
         }
     }
@@ -288,7 +427,7 @@ class MixedVoltraController(
         checkOpen()
         check(topology.tryLock()) { "A Twin connection change is already in progress." }
         try {
-            val current = refresh()
+            val current = commandSnapshot()
             check(current.connectionError == null) { requireNotNull(current.connectionError) }
             check(!current.twinPending) { "Wait for the current Twin connection change." }
             topologyOperation = currentCoroutineContext().job
@@ -390,7 +529,7 @@ class MixedVoltraController(
             val current = refresh()
             check(
                 lastOfferedPeer?.id.equals(request.peerId, true) &&
-                    current.canCreateTwin &&
+                    current.canCreateTwinAfterUnloading &&
                     current.hasMixedConnections &&
                     current.knob?.mixedTwinHandoffSupported == true
             ) {
@@ -406,14 +545,20 @@ class MixedVoltraController(
                         it.device.id.equals(request.peerId, true)
                 }
             bridge.reportTwinRequest(request, KnobTwinRequestStatus.ACCEPTED)
-            createTwin(controller.device.id, peer.device.id)
+            createTwinAfterUnloading(controller.device.id, peer.device.id) {
+                !closed &&
+                    job.isActive &&
+                    knob?.state?.value?.knob?.device?.id.equals(current.knob?.device?.id, true)
+            }
             outcome = KnobTwinRequestStatus.SUCCEEDED
         } catch (_: TimeoutCancellationException) {
             // Deduplication already consumed this request. Report failure if possible and keep
             // listening for a new explicit request after the connection recovers.
             currentCoroutineContext().ensureActive()
-        } catch (cancelled: CancellationException) {
-            throw cancelled
+        } catch (_: CancellationException) {
+            // A cancelled manual preparation must not kill this long-lived request collector.
+            // Actual owner cancellation still propagates; no control request is replayed.
+            currentCoroutineContext().ensureActive()
         } catch (_: Exception) {
             // The knob displays failure. An explicit new request is required; no replay on
             // reconnect.
@@ -446,7 +591,11 @@ class MixedVoltraController(
         }
     }
 
-    private fun independentKnob(state: VoltraState, original: Handoff): Boolean =
+    private fun independentKnob(
+        state: VoltraState,
+        original: Handoff,
+        requireUnloaded: Boolean = true,
+    ): Boolean =
         state.knob?.device?.id.equals(original.knobId, true) &&
             state.knob?.status == ConnectionStatus.READY &&
             state.twin == null &&
@@ -456,7 +605,7 @@ class MixedVoltraController(
                 it.device.id.equals(original.controllerId, true) &&
                     it.connected &&
                     it.fresh &&
-                    it.unloaded &&
+                    (!requireUnloaded || it.unloaded) &&
                     !it.pending &&
                     it.twinStatusKnown &&
                     !it.twinReported
@@ -566,12 +715,15 @@ class MixedVoltraController(
         direct.connect(original.peer)
         handoff = null
         recoveryBlocked = false
+        reconnectingRecovery = null
         refresh()
     }
 
     override fun beginSet() {
         checkOpen()
-        check(refresh().connectionError == null) { "Resolve the device connection conflict first." }
+        val current = refresh()
+        check(current.connectionError == null) { "Resolve the device connection conflict first." }
+        check(!current.twinPending) { "Wait for the Twin connection change before starting a set." }
         direct.beginSet()
         knob?.beginSet()
         refresh()
@@ -587,6 +739,7 @@ class MixedVoltraController(
     override fun close() {
         if (closed) return
         closed = true
+        manualPreparationJob?.cancel()
         topologyOperation?.cancel()
         job.cancel()
         try {
@@ -604,15 +757,33 @@ class MixedVoltraController(
         }
     }
 
-    private fun commandOwner(deviceId: String): Owner {
-        checkOpen()
-        val current = refresh()
+    private suspend fun commandOwner(deviceId: String): Owner {
+        val current = commandSnapshot()
         check(current.connectionError == null) { requireNotNull(current.connectionError) }
         check(!current.twinPending) {
             "Wait for the Twin connection change before adjusting settings."
         }
         return owners(deviceId).singleOrNull() ?: error("This trainer is no longer connected.")
     }
+
+    private suspend fun commandSnapshot(): VoltraState {
+        checkOpen()
+        val owner = manualPreparation ?: return refresh()
+        check(currentCoroutineContext()[ManualPreparation] === owner) {
+            "Wait for manual Twin preparation to finish before changing the trainers."
+        }
+        return preparationSnapshot()
+    }
+
+    private fun preparationSnapshot(): VoltraState =
+        refresh()
+            .copy(
+                twinPending =
+                    topologyPending ||
+                        localExitRestoreQueued ||
+                        direct.state.value.twinPending ||
+                        knob?.state?.value?.twinPending == true
+            )
 
     private fun lifecycleOwner(deviceId: String): Owner? {
         refresh()
@@ -679,11 +850,31 @@ class MixedVoltraController(
             recoveryBlocked &&
                 knobState != null &&
                 handoff?.let {
-                    confirmedPair(knobState, it.controllerId, it.peer.id) &&
+                    knobState.knob?.device?.id.equals(it.knobId, true) &&
+                        knobState.knob?.status == ConnectionStatus.READY &&
+                        knobState.connectionError == null &&
+                        confirmedPair(knobState, it.controllerId, it.peer.id) &&
                         knobState.twin?.controllerId.equals(it.controllerId, true)
                 } == true
-        )
+        ) {
             recoveryBlocked = false
+            reconnectingRecovery = null
+        }
+        reconnectingRecovery?.let { original ->
+            if (
+                recoveryBlocked &&
+                    handoff === original &&
+                    knobState != null &&
+                    knobState.connectionError == null &&
+                    independentKnob(knobState, original, requireUnloaded = false)
+            ) {
+                // A new session proved that pairing did not persist. Do not silently reconnect
+                // the former direct peer or replay the request; the user can reconnect it next.
+                recoveryBlocked = false
+                reconnectingRecovery = null
+                handoff = null
+            }
+        }
         observeLocalTwinExit(directState, knobState)
         knobState?.knob?.device?.let { knownKnobs += it.id.identity() }
         val sources =
@@ -706,6 +897,26 @@ class MixedVoltraController(
             Continuity(childContinuity(directState), knobState?.let(::childContinuity), conflict)
         if (continuity != null && continuity != nextContinuity) telemetryEpoch++
         continuity = nextContinuity
+        val boundEpochs =
+            trainerEpochs.update(
+                sources.associate { (route, trainer) ->
+                    val child = if (route == VoltraConnectionRoute.DIRECT) directState else requireNotNull(knobState)
+                    val pair = child.twin?.takeIf {
+                        trainer.device.id.equals(it.controllerId, true) ||
+                            trainer.device.id.equals(it.peerId, true)
+                    }
+                    trainer.device.id to MixedTelemetrySource(
+                        route,
+                        child.telemetryEpochFor(trainer.device.id),
+                        trainer.telemetrySource(),
+                        pair?.let { it.controllerId.identity() to it.peerId.identity() },
+                        child.knob?.takeIf { route == VoltraConnectionRoute.KNOB }?.let {
+                            it.device.id.identity() to it.status
+                        },
+                        conflict,
+                    )
+                }
+            )
         val routes = mutableMapOf<String, VoltraConnectionRoute>()
         knobState?.knob?.twinCandidate?.let { routes[it.id] = VoltraConnectionRoute.KNOB }
         // A directly connected trainer overrides the knob's merely nearby candidate identity.
@@ -757,7 +968,8 @@ class MixedVoltraController(
                             reps = null,
                         ),
                 twinPending =
-                    topologyPending ||
+                    manualPreparation != null ||
+                        topologyPending ||
                         localExitRestoreQueued ||
                         directState.twinPending ||
                         knobState?.twinPending == true,
@@ -773,8 +985,18 @@ class MixedVoltraController(
                 knob = knobState?.knob,
                 viaKnob = discoveryRoute.value == VoltraConnectionRoute.KNOB,
                 telemetryEpoch = telemetryEpoch,
+                trainerTelemetryEpochs = boundEpochs,
                 trainerRoutes = routes,
                 connectionError = conflict,
+                recoverableKnobId =
+                    handoff?.knobId.takeIf {
+                        recoveryBlocked &&
+                            !topologyPending &&
+                            manualPreparation == null &&
+                            !localExitRestoreQueued &&
+                            knobState != null &&
+                            knobState.knob?.status != ConnectionStatus.CONNECTING
+                    },
                 topologyRevision =
                     maxOf(directState.topologyRevision, knobState?.topologyRevision ?: 0),
             )
@@ -798,6 +1020,10 @@ class MixedVoltraController(
             state.twin?.let { it.controllerId.identity() to it.peerId.identity() },
             state.knob?.let { it.device.id.identity() to it.status },
         )
+
+    private class ManualPreparation : AbstractCoroutineContextElement(Key) {
+        companion object Key : CoroutineContext.Key<ManualPreparation>
+    }
 
     private data class Owner(
         val controller: VoltraController,
@@ -832,6 +1058,15 @@ class MixedVoltraController(
         val status: ConnectionStatus,
         val fresh: Boolean,
         val mode: Int?,
+    )
+
+    private data class MixedTelemetrySource(
+        val route: VoltraConnectionRoute,
+        val childEpoch: Long,
+        val trainer: TrainerTelemetrySource,
+        val twin: Pair<String, String>?,
+        val knob: Pair<String, ConnectionStatus>?,
+        val conflict: String?,
     )
 
     private fun String.identity() = lowercase(Locale.ROOT)

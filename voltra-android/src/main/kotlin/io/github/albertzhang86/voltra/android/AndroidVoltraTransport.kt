@@ -7,9 +7,11 @@ import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import io.github.albertzhang86.voltra.*
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.awaitClose
@@ -18,6 +20,14 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 internal object VoltraGatt {
+    private val connectionIds = AtomicInteger()
+
+    fun nextConnectionId(): Int = connectionIds.incrementAndGet()
+
+    fun trace(message: String) {
+        if (Log.isLoggable("VoltraGatt", Log.DEBUG)) Log.d("VoltraGatt", message)
+    }
+
     val service: UUID = UUID.fromString("e4dada34-0867-8783-9f70-2ca29216c7e4")
     val write: UUID = UUID.fromString("a010891d-f50f-44f0-901f-9a2421a9e050")
     val notify: UUID = UUID.fromString("55ca1e52-7354-25de-6afc-b7df1e8816ac")
@@ -32,6 +42,10 @@ internal data class GattProfile(
     val minimumMtu: Int = 64,
     val connectTimeoutMs: Long = 15_000,
     val label: String = "VOLTRA",
+    /** The knob creates a new command session on an authenticated CCCD disable/enable cycle. */
+    val renewNotificationSubscription: Boolean = false,
+    /** Retry only an early direct-trainer radio failure, before service discovery begins. */
+    val retryEstablishment: Boolean = true,
 )
 
 /** One native GATT instance per trainer; the controller enforces the two-device limit. */
@@ -111,23 +125,31 @@ internal constructor(context: Context, private val profile: GattProfile) : Voltr
             .conflate()
 
     override suspend fun connect(device: VoltraDevice): VoltraLink =
-        withContext(Dispatchers.Main.immediate) {
-            VoltraBluetooth.problem(context, scanning = false)?.let { error(it) }
-            require(BluetoothAdapter.checkBluetoothAddress(device.id)) {
-                "Select a discovered ${profile.label}."
-            }
-            val link =
-                AndroidVoltraLink(
-                    context,
-                    requireNotNull(adapter).getRemoteDevice(device.id),
-                    profile,
-                )
-            try {
-                withTimeout(profile.connectTimeoutMs) { link.ready.await() }
-                link
-            } catch (failure: Exception) {
-                link.close()
-                throw failure
+        withGattConnectionOwnership<AndroidVoltraLink> { retain ->
+            withContext(Dispatchers.Main.immediate) {
+                VoltraBluetooth.problem(context, scanning = false)?.let { error(it) }
+                require(BluetoothAdapter.checkBluetoothAddress(device.id)) {
+                    "Select a discovered ${profile.label}."
+                }
+                withTimeout(profile.connectTimeoutMs) {
+                    establishGattConnection(
+                        retryEstablishment = profile.retryEstablishment,
+                        createAttempt = { attempt ->
+                            VoltraBluetooth.problem(context, scanning = false)?.let { error(it) }
+                            AndroidVoltraLink(
+                                context,
+                                requireNotNull(adapter).getRemoteDevice(device.id),
+                                profile,
+                                attempt,
+                            ).also(retain)
+                        },
+                        onRetry = {
+                            VoltraGatt.trace(
+                                "${profile.label} establishment retry in 1000ms status=${it.status} phase=${it.phase}"
+                            )
+                        },
+                    )
+                }
             }
         }
 }
@@ -137,39 +159,54 @@ private class AndroidVoltraLink(
     private val context: Context,
     device: BluetoothDevice,
     private val profile: GattProfile,
-) : VoltraLink {
-    val ready = CompletableDeferred<Unit>()
+    attempt: Int,
+) : VoltraLink, GattConnectionAttempt {
+    private val ready = CompletableDeferred<Unit>()
+    private val connectionId = VoltraGatt.nextConnectionId()
+    private var phase = GattConnectionPhase.CONNECTING
     private val incoming = Channel<ByteArray>(256)
     override val packets = incoming.receiveAsFlow()
     private val closed = AtomicBoolean()
-    private val setup = GattSetupGate()
+    private val setup = GattSetupGate(profile.renewNotificationSubscription)
     private val writeMutex = Mutex()
     private var writer: BluetoothGattCharacteristic? = null
     private var descriptor: BluetoothGattDescriptor? = null
     private var writeResult: CompletableDeferred<Unit>? = null
+    private var revocationResult: CompletableDeferred<Unit>? = null
+    private var revocationFinished: CompletableDeferred<Unit>? = null
     private val callback =
         object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
                 if (closed.get()) return
+                trace("connection callback status=$status state=$newState")
                 if (
                     status != BluetoothGatt.GATT_SUCCESS ||
                         newState == BluetoothProfile.STATE_DISCONNECTED
                 ) {
-                    fail("${profile.label} disconnected ($status). Reconnect to continue.")
+                    val message =
+                        if (phase in setOf(GattConnectionPhase.CONNECTING, GattConnectionPhase.MTU))
+                            "${profile.label} connection could not be established ($status). Try again."
+                        else "${profile.label} disconnected ($status). Reconnect to continue."
+                    fail(GattConnectionFailure(status, phase, message))
                     return
                 }
-                if (newState == BluetoothProfile.STATE_CONNECTED)
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    if (phase != GattConnectionPhase.CONNECTING) return
+                    phase = GattConnectionPhase.MTU
                     operation {
                         check(gatt.requestMtu(517)) { "Unable to negotiate Bluetooth packet size." }
                     }
+                }
             }
 
             override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                trace("MTU callback status=$status mtu=$mtu")
                 if (closed.get() || !setup.beginDiscovery()) return
                 operation {
                     check(status == BluetoothGatt.GATT_SUCCESS && mtu >= profile.minimumMtu) {
                         "${profile.label} requires a larger Bluetooth packet size."
                     }
+                    phase = GattConnectionPhase.SERVICES
                     check(gatt.discoverServices()) {
                         "Unable to discover ${profile.label} services."
                     }
@@ -177,6 +214,7 @@ private class AndroidVoltraLink(
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                trace("services callback status=$status")
                 if (closed.get() || !setup.beginSubscription()) return
                 operation {
                     check(status == BluetoothGatt.GATT_SUCCESS) {
@@ -196,7 +234,12 @@ private class AndroidVoltraLink(
                     descriptor =
                         updates.getDescriptor(VoltraGatt.cccd)
                             ?: error("${profile.label} subscription is unavailable.")
-                    subscribe(gatt, requireNotNull(descriptor))
+                    phase = GattConnectionPhase.SUBSCRIPTION
+                    subscribe(
+                        gatt,
+                        requireNotNull(descriptor),
+                        enabled = !profile.renewNotificationSubscription,
+                    )
                 }
             }
 
@@ -206,9 +249,27 @@ private class AndroidVoltraLink(
                 status: Int,
             ) {
                 if (closed.get() || written !== descriptor) return
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    if (setup.complete()) ready.complete(Unit)
-                } else fail("${profile.label} subscription failed.")
+                trace("subscription callback status=$status")
+                if (setup.isRevoking) {
+                    if (status == BluetoothGatt.GATT_SUCCESS) revocationResult?.complete(Unit)
+                    else
+                        revocationResult?.completeExceptionally(
+                            IllegalStateException("${profile.label} session revocation failed.")
+                        )
+                    return
+                }
+                operation {
+                    check(status == BluetoothGatt.GATT_SUCCESS) {
+                        "${profile.label} subscription failed. Reconnect to continue."
+                    }
+                    if (setup.finishSubscriptionReset()) {
+                        subscribe(gatt, written, enabled = true)
+                    } else if (setup.complete()) {
+                        phase = GattConnectionPhase.READY
+                        trace("ready")
+                        ready.complete(Unit)
+                    }
+                }
             }
 
             override fun onCharacteristicWrite(
@@ -239,6 +300,7 @@ private class AndroidVoltraLink(
             private fun receive(characteristic: BluetoothGattCharacteristic, value: ByteArray) {
                 if (
                     !closed.get() &&
+                        (!profile.renewNotificationSubscription || setup.isReady) &&
                         characteristic.uuid == profile.notify &&
                         characteristic.service?.uuid == profile.service
                 ) {
@@ -248,18 +310,29 @@ private class AndroidVoltraLink(
             }
         }
     private val gatt =
-        device.connectGatt(
-            context,
-            false,
-            callback,
-            BluetoothDevice.TRANSPORT_LE,
-            BluetoothDevice.PHY_LE_1M_MASK,
-            Handler(Looper.getMainLooper()),
-        ) ?: error("Could not connect to ${profile.label}.")
+        run {
+            trace("connect attempt=$attempt")
+            device.connectGatt(
+                context,
+                false,
+                callback,
+                BluetoothDevice.TRANSPORT_LE,
+                BluetoothDevice.PHY_LE_1M_MASK,
+                Handler(Looper.getMainLooper()),
+            ) ?: error("Could not connect to ${profile.label}.")
+        }
+
+    override suspend fun awaitReady() = ready.await()
 
     @Suppress("DEPRECATION")
-    private fun subscribe(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor) {
-        val value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+    private fun subscribe(
+        gatt: BluetoothGatt,
+        descriptor: BluetoothGattDescriptor,
+        enabled: Boolean,
+    ) {
+        val value =
+            if (enabled) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
         val accepted =
             if (Build.VERSION.SDK_INT >= 33)
                 gatt.writeDescriptor(descriptor, value) == BluetoothStatusCodes.SUCCESS
@@ -267,13 +340,17 @@ private class AndroidVoltraLink(
                 descriptor.value = value
                 gatt.writeDescriptor(descriptor)
             }
-        check(accepted) { "Unable to subscribe to ${profile.label}." }
+        check(accepted) {
+            if (enabled) "Unable to subscribe to ${profile.label}."
+            else "Unable to reset the ${profile.label} subscription."
+        }
     }
 
     override suspend fun write(frame: ByteArray) =
         withContext(Dispatchers.Main.immediate) {
+            check(!setup.isRevoking) { "${profile.label} session is closing." }
             writeMutex.withLock {
-                check(!closed.get()) { "${profile.label} disconnected." }
+                check(!closed.get() && !setup.isRevoking) { "${profile.label} disconnected." }
                 VoltraBluetooth.problem(context, scanning = false)?.let {
                     fail(it)
                     error(it)
@@ -304,6 +381,41 @@ private class AndroidVoltraLink(
             }
         }
 
+    /**
+     * Android may keep a bonded physical link alive after GATT close. The knob revokes its worker
+     * epoch synchronously on CCCD disable, so await that acknowledgement before closing when
+     * possible.
+     */
+    override suspend fun revoke() =
+        withContext(NonCancellable + Dispatchers.Main.immediate) {
+            revocationFinished?.let {
+                withTimeoutOrNull(500) { it.await() }
+                return@withContext
+            }
+            val finished = CompletableDeferred<Unit>().also { revocationFinished = it }
+            try {
+                if (closed.get() || !setup.beginRevocation()) return@withContext
+                phase = GattConnectionPhase.REVOKING
+                trace("revocation requested")
+                // No old snapshot may authorize another command while the epoch is being revoked.
+                while (incoming.tryReceive().isSuccess) Unit
+                withTimeout(500) {
+                    writeMutex.withLock {
+                        if (closed.get()) return@withLock
+                        val completion = CompletableDeferred<Unit>()
+                        revocationResult = completion
+                        subscribe(gatt, requireNotNull(descriptor), enabled = false)
+                        completion.await()
+                    }
+                }
+            } catch (_: Exception) {
+                // An in-flight operation, rejected CCCD, or missing ACK falls back to link closure.
+            } finally {
+                close()
+                finished.complete(Unit)
+            }
+        }
+
     @Suppress("DEPRECATION")
     private fun writeNative(
         characteristic: BluetoothGattCharacteristic,
@@ -328,21 +440,32 @@ private class AndroidVoltraLink(
         }
     }
 
-    private fun fail(message: String) {
-        val error = IllegalStateException(message)
+    private fun fail(message: String) = fail(IllegalStateException(message))
+
+    private fun fail(error: Exception) {
+        trace("failure ${error.javaClass.simpleName}: ${error.message}")
         ready.completeExceptionally(error)
         writeResult?.completeExceptionally(error)
+        revocationResult?.completeExceptionally(error)
         incoming.close(error)
-        close()
+        close("failure")
     }
 
-    override fun close() {
+    override fun close() = close("caller")
+
+    private fun close(reason: String) {
         if (closed.getAndSet(true)) return
+        trace("close reason=$reason")
+        phase = GattConnectionPhase.CLOSED
         setup.close()
         ready.cancel()
         writeResult?.cancel()
+        revocationResult?.cancel()
         incoming.close()
         runCatching { gatt.disconnect() }
         runCatching { gatt.close() }
     }
+
+    private fun trace(event: String) =
+        VoltraGatt.trace("link=$connectionId ${profile.label} phase=$phase $event")
 }

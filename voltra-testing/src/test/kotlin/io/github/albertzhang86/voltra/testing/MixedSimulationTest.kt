@@ -10,6 +10,42 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class MixedSimulationTest {
     @Test
+    fun `explicit motor operations follow ownership and Twin controller without changing the other trainer`() =
+        runTest {
+            val direct = SimulatedVoltraController(backgroundScope)
+            val knob =
+                SimulatedKnobController(
+                    backgroundScope,
+                    listOf(SimulatedVoltraController.devices.last()),
+                )
+            val combined = MixedVoltraController(direct, knob, backgroundScope)
+            combined.connect(SimulatedVoltraController.devices.first())
+            combined.selectRoute(VoltraConnectionRoute.KNOB)
+            combined.connect(SimulatedKnobController.DEVICE)
+            runCurrent()
+            combined.setLoaded("demo-left", true)
+            runCurrent()
+            assertTrue(direct.state.value.trainers.single().loaded)
+            assertTrue(knob.state.value.trainers.single().unloaded)
+            combined.setLoaded("demo-left", false)
+            runCurrent()
+            combined.createTwin("demo-left", "demo-right")
+            runCurrent()
+            assertTrue(runCatching { combined.setLoaded("demo-left", true) }.isFailure)
+            combined.setLoaded("demo-right", true)
+            runCurrent()
+            assertTrue(combined.currentState.trainers.all { it.loaded })
+            assertFalse(combined.currentState.canExitTwin)
+            combined.setLoaded("demo-right", false)
+            runCurrent()
+            assertTrue(combined.currentState.canExitTwin)
+            combined.exitTwin()
+            runCurrent()
+            assertTrue(combined.currentState.hasMixedConnections)
+            combined.close()
+        }
+
+    @Test
     fun `direct and single-trainer knob demo retain independent modes and weights`() = runTest {
         val direct = SimulatedVoltraController(backgroundScope)
         val knob =

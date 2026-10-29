@@ -90,8 +90,9 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
                 trainers =
                     it.trainers +
                         TrainerState(
-                            device,
-                            ConnectionStatus.READY,
+                            device = device,
+                            status = ConnectionStatus.READY,
+                            lengthUnit = LengthUnit.CENTIMETERS,
                             mode = TrainingMode.WEIGHT,
                             parameters = defaults,
                             batteryPercent = if (device == devices.first()) 86 else 72,
@@ -103,6 +104,9 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
                             fresh = true,
                             twinStatusKnown = true,
                             isSimulated = true,
+                            loadControlSupported = true,
+                            loadAllowed = true,
+                            unloadAllowed = true,
                         )
             )
         }
@@ -198,6 +202,24 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
         }
     }
 
+    override suspend fun setLoaded(deviceId: String, loaded: Boolean) {
+        val current = state.value.trainers.single { it.device.id == deviceId }
+        check(
+            current.connected &&
+                current.fresh &&
+                !current.pending &&
+                current.mode != null &&
+                current.twinStatusKnown &&
+                (!current.twinReported ||
+                    (current.twinVerified && current.twinRole == TwinRole.CONTROLLER))
+        )
+        if (if (loaded) current.loaded else current.unloaded) return
+        edit(deviceId) {
+            check(if (loaded) it.canLoad else it.canUnload)
+            it.copy(fitnessMode = if (loaded) 5 else 4)
+        }
+    }
+
     private suspend fun edit(deviceId: String, transform: (TrainerState) -> TrainerState) =
         serialCommand {
             check(job.isActive)
@@ -215,7 +237,11 @@ class SimulatedVoltraController(parentScope: CoroutineScope) : VoltraController 
                     .filter { it.device.id in ids }
                     .associate { trainer ->
                         trainer.device.id to
-                            trainer.copy(mode = changed.mode, parameters = changed.parameters)
+                            trainer.copy(
+                                mode = changed.mode,
+                                parameters = changed.parameters,
+                                fitnessMode = changed.fitnessMode,
+                            )
                     }
             mutableState.update {
                 it.copy(

@@ -11,6 +11,9 @@ import kotlinx.coroutines.flow.StateFlow
 interface VoltraController : AutoCloseable {
     val state: StateFlow<VoltraState>
 
+    /** Display one operation across its reconnects. Close on success, failure or cancellation. */
+    fun beginSetupActivity(activity: SetupActivity): AutoCloseable = AutoCloseable {}
+
     fun scan(): Flow<List<VoltraDevice>>
 
     suspend fun connect(device: VoltraDevice)
@@ -28,9 +31,30 @@ interface VoltraController : AutoCloseable {
 
     suspend fun setParameter(deviceId: String, parameter: Parameter, value: Int)
 
+    /**
+     * Explicit motor operation. Returns only after fresh device confirmation; never retried or
+     * implied by beginSet/endSet. Unsupported connectors reject actual motor changes.
+     */
+    suspend fun setLoaded(deviceId: String, loaded: Boolean) {
+        throw UnsupportedOperationException(
+            "This connector does not support confirmed load control."
+        )
+    }
+
     suspend fun createTwin(controllerId: String, peerId: String)
 
     suspend fun exitTwin()
+
+    /** Explicit user-authorized Twin action: confirm required unloading, then change topology. */
+    suspend fun createTwinAfterUnloading(
+        controllerId: String,
+        peerId: String,
+        stillRelevant: () -> Boolean = { true },
+    ) = prepareTwinChange(this, controllerId, peerId, create = true, stillRelevant)
+
+    /** Never loads either trainer. Unknown state or a failed STOP prevents the Twin command. */
+    suspend fun exitTwinAfterUnloading(stillRelevant: () -> Boolean = { true }) =
+        prepareTwinChange(this, null, null, create = false, stillRelevant)
 
     /** Establish an app set boundary without sending a load/unload command to the motor. */
     fun beginSet()
@@ -55,6 +79,9 @@ interface VoltraLink : AutoCloseable {
     val packets: Flow<ByteArray>
 
     suspend fun write(frame: ByteArray)
+
+    /** Revoke an authenticated command session where supported, then close the connection. */
+    suspend fun revoke() = close()
 
     override fun close()
 }

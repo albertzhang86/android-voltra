@@ -1,5 +1,6 @@
 package io.github.albertzhang86.voltra
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
@@ -16,6 +17,123 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class MixedVoltraControllerTest {
+    @Test
+    fun `loaded mixed knob request confirms both STOPs before releasing peer and never reloads`() =
+        runTest {
+            fun loaded(device: VoltraDevice) =
+                trainer(device)
+                    .copy(fitnessMode = 5, loadControlSupported = true, unloadAllowed = true)
+            val direct = FakeController(VoltraState(trainers = listOf(loaded(LEFT))))
+            val knob = FakeKnobBridge(knobState(loaded(RIGHT), candidate = LEFT).bidirectional())
+            val mixed = MixedVoltraController(direct, knob, backgroundScope)
+            runCurrent()
+            assertFalse(mixed.state.value.canCreateTwin)
+            assertTrue(mixed.state.value.canCreateTwinAfterUnloading)
+            assertTrue(knob.offerReadiness.last())
+            direct.afterDisconnect = { assertTrue(knob.state.value.trainers.single().unloaded) }
+            knob.beforeCreate = {
+                assertTrue(direct.state.value.trainers.isEmpty())
+                assertTrue(knob.state.value.trainers.single().unloaded)
+            }
+            val request = KnobTwinRequest(11, 22, 1, LEFT.id)
+            knob.twinRequests.emit(request)
+            runCurrent()
+            assertEquals(listOf("unload:${LEFT.id}", "disconnect:${LEFT.id}"), direct.calls)
+            assertEquals(listOf("unload:${RIGHT.id}", "twin:${RIGHT.id}:${LEFT.id}"), knob.calls)
+            assertEquals(KnobTwinRequestStatus.SUCCEEDED, knob.reports.last().second)
+            knob.twinRequests.emit(request)
+            runCurrent()
+            assertEquals(2, direct.calls.size)
+            assertEquals(2, knob.calls.size)
+            mixed.close()
+        }
+
+    @Test
+    fun `manual preparation blocks competing next-set controls between STOPs until pairing finishes`() =
+        runTest {
+            fun loaded(device: VoltraDevice) =
+                trainer(device)
+                    .copy(fitnessMode = 5, loadControlSupported = true, unloadAllowed = true)
+            val direct = FakeController(VoltraState(trainers = listOf(loaded(LEFT))))
+            val knob = FakeKnobBridge(knobState(loaded(RIGHT), candidate = LEFT).bidirectional())
+            val mixed = MixedVoltraController(direct, knob, backgroundScope)
+            val continueSecondStop = CompletableDeferred<Unit>()
+            var motorCalls = 0
+            knob.beforeSetLoaded = {
+                motorCalls++
+                continueSecondStop.await()
+            }
+            runCurrent()
+            knob.twinRequests.emit(KnobTwinRequest(11, 22, 1, LEFT.id))
+            runCurrent()
+            assertTrue(direct.state.value.trainers.single().unloaded)
+            assertTrue(knob.state.value.trainers.single().loaded)
+            assertTrue(mixed.state.value.twinPending)
+            assertFalse(mixed.state.value.canCreateTwinAfterUnloading)
+            // No child pending flag protects this gap: the aggregate operation owner must do so.
+            assertTrue(mixed.state.value.trainers.none { it.pending })
+            assertFailure { mixed.setMode(RIGHT.id, TrainingMode.BAND) }
+            assertFailure { mixed.setParameter(LEFT.id, Parameter.WEIGHT, 45) }
+            assertFailure { mixed.setLoaded(RIGHT.id, true) }
+            assertFailure { mixed.beginSet() }
+            assertFailure { mixed.createTwin(RIGHT.id, LEFT.id) }
+            assertFailure { mixed.exitTwin() }
+            assertFailure { mixed.createTwinAfterUnloading(RIGHT.id, LEFT.id) }
+            assertFailure { mixed.disconnect(LEFT.id) }
+            assertFailure { mixed.forget(KNOB.id) }
+            assertEquals(1, motorCalls)
+            assertEquals(listOf("unload:${LEFT.id}"), direct.calls)
+            assertTrue(knob.calls.isEmpty())
+            continueSecondStop.complete(Unit)
+            runCurrent()
+            assertFalse(mixed.state.value.twinPending)
+            assertEquals(KnobTwinRequestStatus.SUCCEEDED, knob.reports.last().second)
+            assertEquals(listOf("unload:${RIGHT.id}", "twin:${RIGHT.id}:${LEFT.id}"), knob.calls)
+            assertEquals(listOf("unload:${LEFT.id}", "disconnect:${LEFT.id}"), direct.calls)
+            mixed.close()
+        }
+
+    @Test
+    fun `cancelled manual preparation releases reservation without replay or loading`() = runTest {
+        fun loaded(device: VoltraDevice) =
+            trainer(device).copy(fitnessMode = 5, loadControlSupported = true, unloadAllowed = true)
+        val direct = FakeController(VoltraState(trainers = listOf(loaded(LEFT))))
+        val knob = FakeController(knobState(loaded(RIGHT), candidate = LEFT).guarded())
+        val mixed = MixedVoltraController(direct, knob, backgroundScope)
+        knob.beforeSetLoaded = { awaitCancellation() }
+        val operation = launch { mixed.createTwinAfterUnloading(RIGHT.id, LEFT.id) }
+        runCurrent()
+        assertTrue(mixed.state.value.twinPending)
+        operation.cancel()
+        operation.join()
+        assertFalse(mixed.state.value.twinPending)
+        assertTrue(knob.calls.isEmpty())
+        assertEquals(listOf("unload:${LEFT.id}"), direct.calls)
+        mixed.setParameter(LEFT.id, Parameter.WEIGHT, 40)
+        assertEquals("parameter:${LEFT.id}:WEIGHT:40", direct.calls.last())
+        mixed.close()
+    }
+
+    @Test
+    fun `manual preparation cannot take ownership during an already dispatched setting command`() =
+        runTest {
+            val direct = FakeController(VoltraState(trainers = listOf(trainer(LEFT))))
+            val knob = FakeController(knobState(trainer(RIGHT), candidate = LEFT).guarded())
+            val mixed = MixedVoltraController(direct, knob, backgroundScope)
+            val finishSetting = CompletableDeferred<Unit>()
+            direct.beforeSetParameter = { finishSetting.await() }
+            val setting = launch { mixed.setParameter(LEFT.id, Parameter.WEIGHT, 40) }
+            runCurrent()
+            assertFailure { mixed.createTwinAfterUnloading(RIGHT.id, LEFT.id) }
+            assertFalse(mixed.state.value.twinPending)
+            assertTrue(knob.calls.isEmpty())
+            finishSetting.complete(Unit)
+            setting.join()
+            mixed.createTwinAfterUnloading(RIGHT.id, LEFT.id)
+            assertEquals("twin:${RIGHT.id}:${LEFT.id}", knob.calls.single())
+            mixed.close()
+        }
+
     @Test
     fun `discovery switching preserves both connections and routes controls by trainer identity`() =
         runTest {
@@ -71,6 +189,93 @@ class MixedVoltraControllerTest {
         assertTrue(direct.calls.isEmpty())
         assertTrue(knob.calls.isEmpty())
         scan.cancel()
+        mixed.close()
+    }
+
+    @Test
+    fun `offline direct reconnect preserves exact owner and knob discovery without replaying control`() =
+        runTest {
+            for (status in listOf(ConnectionStatus.FAILED, ConnectionStatus.DISCONNECTED)) {
+                val offline =
+                    trainer(LEFT).copy(status = status, fresh = false, error = "Disconnected (133)")
+                val direct = FakeController(VoltraState(trainers = listOf(offline)))
+                val knob = FakeController(knobState(trainer(RIGHT)))
+                val mixed =
+                    MixedVoltraController(direct, knob, backgroundScope, VoltraConnectionRoute.KNOB)
+                val knobBefore = knob.state.value
+                mixed.connect(LEFT.copy(id = LEFT.id.lowercase(), name = "Caller spelling"))
+                assertEquals(listOf("disconnect:${LEFT.id}", "connect:${LEFT.id}"), direct.calls)
+                assertTrue(knob.calls.isEmpty())
+                assertEquals(knobBefore, knob.state.value)
+                assertTrue(mixed.state.value.viaKnob)
+                assertEquals(LEFT, mixed.state.value.trainers.first().device)
+                assertEquals(VoltraConnectionRoute.DIRECT, mixed.state.value.routeFor(LEFT.id))
+                assertFailure { mixed.connect(LEFT) }
+                assertEquals(2, direct.calls.size)
+                advanceTimeBy(5000)
+                runCurrent()
+                assertEquals(2, direct.calls.size)
+                mixed.close()
+            }
+        }
+
+    @Test
+    fun `reconnect never replaces active or connecting owner or steals a knob trainer`() = runTest {
+        for (status in listOf(ConnectionStatus.READY, ConnectionStatus.CONNECTING)) {
+            val direct =
+                FakeController(VoltraState(trainers = listOf(trainer(LEFT).copy(status = status))))
+            val knob = FakeController(knobState(trainer(RIGHT)))
+            val mixed = MixedVoltraController(direct, knob, backgroundScope)
+            assertFailure { mixed.connect(LEFT) }
+            assertFailure { mixed.connect(RIGHT) }
+            assertTrue(direct.calls.isEmpty())
+            assertTrue(knob.calls.isEmpty())
+            mixed.close()
+        }
+    }
+
+    @Test
+    fun `cancelled recovery never dispatches its replacement connection`() = runTest {
+        val direct =
+            FakeController(
+                VoltraState(
+                    trainers =
+                        listOf(trainer(LEFT).copy(status = ConnectionStatus.FAILED, fresh = false))
+                )
+            )
+        val knob = FakeController(knobState(trainer(RIGHT)))
+        val mixed = MixedVoltraController(direct, knob, backgroundScope)
+        val reconnect =
+            launch(start = kotlinx.coroutines.CoroutineStart.LAZY) { mixed.connect(LEFT) }
+        direct.afterDisconnect = { reconnect.cancel() }
+        reconnect.start()
+        runCurrent()
+        reconnect.join()
+        assertTrue(reconnect.isCancelled)
+        assertEquals(listOf("disconnect:${LEFT.id}"), direct.calls)
+        assertTrue(knob.calls.isEmpty())
+        advanceTimeBy(5000)
+        runCurrent()
+        assertEquals(1, direct.calls.size)
+        mixed.close()
+    }
+
+    @Test
+    fun `reconnect rechecks ownership after clearing a failed row`() = runTest {
+        val direct =
+            FakeController(
+                VoltraState(
+                    trainers =
+                        listOf(trainer(LEFT).copy(status = ConnectionStatus.FAILED, fresh = false))
+                )
+            )
+        val knob = FakeController(knobState(trainer(RIGHT)))
+        val mixed = MixedVoltraController(direct, knob, backgroundScope)
+        direct.afterDisconnect = { knob.state.value = twinState(RIGHT, LEFT, viaKnob = true) }
+        assertFailure { mixed.connect(LEFT) }
+        assertEquals(listOf("disconnect:${LEFT.id}"), direct.calls)
+        assertTrue(knob.calls.isEmpty())
+        assertEquals(RIGHT.id, mixed.state.value.twin?.controllerId)
         mixed.close()
     }
 
@@ -246,6 +451,49 @@ class MixedVoltraControllerTest {
         assertFalse(mixed.state.value.canExitTwin)
         assertFailure { mixed.exitTwin() }
         assertTrue(knob.calls.isEmpty())
+        mixed.close()
+    }
+
+    @Test
+    fun `restoring an unrelated direct peer never changes the selected knob continuity`() = runTest {
+        val direct = FakeController(VoltraState(trainers = listOf(trainer(LEFT))))
+        val knob = FakeController(knobState(trainer(RIGHT), candidate = LEFT).guarded())
+        val mixed = MixedVoltraController(direct, knob, backgroundScope)
+        val beforeTwin = mixed.state.value.telemetryEpochFor(RIGHT.id)
+        mixed.createTwin(LEFT.id, RIGHT.id)
+        assertTrue(mixed.state.value.telemetryEpochFor(RIGHT.id) > beforeTwin)
+        direct.afterConnect = {
+            direct.state.value = VoltraState(
+                trainers = listOf(trainer(LEFT).copy(status = ConnectionStatus.CONNECTING, fresh = false))
+            )
+        }
+        mixed.exitTwin()
+        val selected = mixed.state.value.telemetryEpochFor(RIGHT.id)
+        val aggregate = mixed.state.value.telemetryEpoch
+        for (restored in listOf(
+            trainer(LEFT).copy(fresh = false, mode = null, modeWireValue = 0),
+            trainer(LEFT).copy(mode = null, modeWireValue = 0),
+            trainer(LEFT),
+            trainer(LEFT).copy(status = ConnectionStatus.FAILED, fresh = false),
+            trainer(LEFT),
+        )) {
+            direct.state.value = VoltraState(trainers = listOf(restored))
+            assertEquals(selected, mixed.state.value.telemetryEpochFor(RIGHT.id.lowercase()))
+        }
+        assertTrue(mixed.state.value.telemetryEpoch > aggregate)
+        val peerEpoch = mixed.state.value.telemetryEpochFor(LEFT.id)
+        knob.state.value = knob.state.value.copy(telemetryEpoch = 5)
+        assertTrue(mixed.state.value.telemetryEpochFor(RIGHT.id) > selected)
+        assertEquals(peerEpoch, mixed.state.value.telemetryEpochFor(LEFT.id))
+        val renewed = mixed.state.value.telemetryEpochFor(RIGHT.id)
+        knob.state.value = knobState(trainer(RIGHT).copy(mode = TrainingMode.BAND, modeWireValue = 2))
+        assertTrue(mixed.state.value.telemetryEpochFor(RIGHT.id) > renewed)
+        val changedMode = mixed.state.value.telemetryEpochFor(RIGHT.id)
+        knob.state.value = knobState()
+        assertTrue(mixed.state.value.telemetryEpochFor(RIGHT.id) > changedMode)
+        val removed = mixed.state.value.telemetryEpochFor(RIGHT.id)
+        knob.state.value = knobState(trainer(RIGHT))
+        assertTrue(mixed.state.value.telemetryEpochFor(RIGHT.id) > removed)
         mixed.close()
     }
 
@@ -506,6 +754,151 @@ class MixedVoltraControllerTest {
             assertTrue(knob.calls.isEmpty())
             mixed.close()
         }
+
+    @Test
+    fun `lost knob can reconnect through uncertain Twin without replaying control`() = runTest {
+        for (paired in listOf(false, true)) {
+            val direct = FakeController(VoltraState(trainers = listOf(trainer(LEFT))))
+            val knob = FakeController(knobState(trainer(RIGHT), candidate = LEFT).guarded())
+            knob.createFailure = IllegalStateException("Native result unavailable")
+            val mixed = MixedVoltraController(direct, knob, backgroundScope)
+            assertFailure { mixed.createTwin(LEFT.id, RIGHT.id) }
+            knob.state.value =
+                knobState().copy(
+                    knob = KnobState(KNOB, ConnectionStatus.FAILED),
+                    telemetryEpoch = 1,
+                )
+            assertNotNull(mixed.state.value.connectionError)
+            assertEquals(KNOB.id, mixed.state.value.recoverableKnobId)
+            assertFailure { mixed.connect(LEFT) }
+            assertFailure { mixed.connect(THIRD) }
+            assertFailure { mixed.connect(KNOB.copy(id = "different-knob")) }
+            knob.afterConnect = {
+                knob.state.value =
+                    knobState().copy(
+                        knob = KnobState(KNOB, ConnectionStatus.CONNECTING),
+                        telemetryEpoch = 2,
+                    )
+            }
+            mixed.selectRoute(VoltraConnectionRoute.DIRECT)
+            mixed.connect(KNOB.copy(id = KNOB.id.lowercase(), name = "Caller spelling"))
+            assertNotNull(mixed.state.value.connectionError)
+            assertNull(mixed.state.value.recoverableKnobId)
+            assertFailure { mixed.connect(KNOB) }
+            assertFailure { mixed.setLoaded(RIGHT.id, true) }
+            assertFailure { mixed.createTwin(RIGHT.id, LEFT.id) }
+            knob.state.value =
+                knobState(trainer(RIGHT).copy(fresh = false)).copy(telemetryEpoch = 2)
+            assertNotNull(mixed.state.value.connectionError)
+            knob.state.value = knobState(trainer(THIRD)).copy(telemetryEpoch = 2)
+            assertNotNull(mixed.state.value.connectionError)
+            knob.state.value = twinState(RIGHT, THIRD, true).copy(telemetryEpoch = 2)
+            assertNotNull(mixed.state.value.connectionError)
+            knob.state.value =
+                if (paired)
+                    twinState(
+                            RIGHT.copy(id = RIGHT.id.lowercase()),
+                            LEFT.copy(id = LEFT.id.lowercase()),
+                            true,
+                        )
+                        .copy(telemetryEpoch = 2)
+                else
+                    knobState(trainer(RIGHT).copy(fitnessMode = 5)).copy(telemetryEpoch = 2)
+            assertNull(mixed.state.value.connectionError)
+            assertNull(mixed.state.value.recoverableKnobId)
+            assertEquals(paired, mixed.state.value.twin != null)
+            advanceTimeBy(5_000)
+            runCurrent()
+            assertEquals(listOf("disconnect:${LEFT.id}"), direct.calls)
+            assertEquals(
+                listOf(
+                    "twin:${RIGHT.id}:${LEFT.id}",
+                    "disconnect:${KNOB.id}",
+                    "connect:${KNOB.id}",
+                ),
+                knob.calls,
+            )
+            assertFalse(mixed.state.value.viaKnob)
+            if (paired) {
+                assertTrue(mixed.state.value.canExitTwin)
+                mixed.exitTwin()
+                assertEquals("exitTwin", knob.calls.last())
+                assertEquals("connect:${LEFT.id}", direct.calls.last())
+                assertNull(mixed.state.value.twin)
+                assertTrue(mixed.state.value.hasMixedConnections)
+            } else {
+                mixed.connect(LEFT)
+                assertEquals("connect:${LEFT.id}", direct.calls.last())
+                assertTrue(mixed.state.value.hasMixedConnections)
+            }
+            mixed.close()
+        }
+    }
+
+    @Test
+    fun `disconnecting an uncertain reconnect keeps topology blocked until a new retry confirms it`() = runTest {
+        val direct = FakeController(VoltraState(trainers = listOf(trainer(LEFT))))
+        val knob = FakeController(knobState(trainer(RIGHT), candidate = LEFT).guarded())
+        knob.createFailure = IllegalStateException("Native result unavailable")
+        val mixed = MixedVoltraController(direct, knob, backgroundScope)
+        assertFailure { mixed.createTwin(LEFT.id, RIGHT.id) }
+        knob.afterConnect = {
+            knob.state.value =
+                knobState().copy(knob = KnobState(KNOB, ConnectionStatus.CONNECTING))
+        }
+        mixed.connect(KNOB)
+        mixed.disconnect(KNOB.id.lowercase())
+        assertNotNull(mixed.state.value.connectionError)
+        assertEquals(KNOB.id, mixed.state.value.recoverableKnobId)
+        assertEquals(ConnectionStatus.DISCONNECTED, mixed.state.value.knob?.status)
+        assertFailure { mixed.connect(LEFT) }
+        assertFailure { mixed.setLoaded(RIGHT.id, true) }
+        // Cancelling must revoke the pending independent-snapshot recovery authorization too.
+        knob.state.value = knobState(trainer(RIGHT))
+        assertNotNull(mixed.state.value.connectionError)
+        advanceTimeBy(5_000)
+        runCurrent()
+        assertEquals(listOf("disconnect:${LEFT.id}"), direct.calls)
+        assertEquals(
+            listOf(
+                "twin:${RIGHT.id}:${LEFT.id}",
+                "disconnect:${KNOB.id}",
+                "connect:${KNOB.id}",
+                "disconnect:${KNOB.id}",
+            ),
+            knob.calls,
+        )
+        knob.afterConnect = {}
+        mixed.connect(KNOB)
+        assertNull(mixed.state.value.connectionError)
+        assertNull(mixed.state.value.recoverableKnobId)
+        assertEquals(listOf("disconnect:${LEFT.id}"), direct.calls)
+        assertEquals("connect:${KNOB.id}", knob.calls.last())
+        mixed.close()
+    }
+
+    @Test
+    fun `cancelled uncertain knob recovery never reconnects or clears the control block`() = runTest {
+        val direct = FakeController(VoltraState(trainers = listOf(trainer(LEFT))))
+        val knob = FakeController(knobState(trainer(RIGHT), candidate = LEFT).guarded())
+        knob.createFailure = IllegalStateException("Native result unavailable")
+        val mixed = MixedVoltraController(direct, knob, backgroundScope)
+        assertFailure { mixed.createTwin(LEFT.id, RIGHT.id) }
+        val reconnect = launch(start = kotlinx.coroutines.CoroutineStart.LAZY) { mixed.connect(KNOB) }
+        knob.afterDisconnect = { reconnect.cancel() }
+        reconnect.start()
+        runCurrent()
+        reconnect.join()
+        assertTrue(reconnect.isCancelled)
+        assertNotNull(mixed.state.value.connectionError)
+        assertEquals(listOf("disconnect:${LEFT.id}"), direct.calls)
+        assertEquals(
+            listOf("twin:${RIGHT.id}:${LEFT.id}", "disconnect:${KNOB.id}"),
+            knob.calls,
+        )
+        assertFailure { mixed.connect(LEFT) }
+        mixed.close()
+    }
 
     @Test
     fun `reconnecting the knob clears uncertain handoff without silently reconnecting the peer`() =
@@ -1032,6 +1425,9 @@ class MixedVoltraControllerTest {
         var createFailure: Exception? = null
         var connectFailure: Exception? = null
         var beforeCreate: suspend () -> Unit = {}
+        var beforeSetLoaded: suspend () -> Unit = {}
+        var beforeSetParameter: suspend () -> Unit = {}
+        var afterConnect: () -> Unit = {}
         var afterDisconnect: () -> Unit = {}
         var afterExit: () -> Unit = {}
 
@@ -1043,6 +1439,7 @@ class MixedVoltraControllerTest {
             state.value =
                 if (device == KNOB) knobState(trainer(RIGHT))
                 else state.value.copy(trainers = state.value.trainers + trainer(device))
+            afterConnect()
         }
 
         override fun disconnect(deviceId: String) {
@@ -1073,7 +1470,23 @@ class MixedVoltraControllerTest {
         }
 
         override suspend fun setParameter(deviceId: String, parameter: Parameter, value: Int) {
+            beforeSetParameter()
             calls += "parameter:$deviceId:$parameter:$value"
+        }
+
+        override suspend fun setLoaded(deviceId: String, loaded: Boolean) {
+            beforeSetLoaded()
+            check(!loaded) { "Manual Twin preparation must never load." }
+            calls += "unload:$deviceId"
+            state.value =
+                state.value.copy(
+                    trainers =
+                        state.value.trainers.map {
+                            if (it.device.id == deviceId || state.value.twin != null)
+                                it.copy(fitnessMode = 4)
+                            else it
+                        }
+                )
         }
 
         override suspend fun createTwin(controllerId: String, peerId: String) {

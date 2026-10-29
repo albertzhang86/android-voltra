@@ -17,6 +17,26 @@ enum class WeightUnit(val symbol: String) {
     }
 }
 
+/** Trainer display preference; wire positions remain cm and velocities remain mm/s. */
+enum class LengthUnit(val symbol: String, val speedSymbol: String) {
+    CENTIMETERS("cm", "m/s"),
+    INCHES("in", "in/s");
+
+    fun displayCentimeters(value: Double): Double =
+        if (this == INCHES) value / 2.54 else value
+
+    fun displayMillimetersPerSecond(value: Int): Double =
+        if (this == INCHES) value / 25.4 else value / 1000.0
+
+    companion object {
+        fun fromWire(value: Int): LengthUnit? = when (value) {
+            0 -> CENTIMETERS
+            1 -> INCHES
+            else -> null
+        }
+    }
+}
+
 enum class TrainingMode(val wireValue: Int, val label: String) {
     WEIGHT(1, "Weight training"),
     BAND(2, "Resistance band"),
@@ -47,6 +67,20 @@ enum class Parameter(
     RETURN_SPEED(0x5411, 2, "Return speed", 0..2000, 100),
     RETURN_WEIGHT(0x5412, 2, "Return weight", 5..100, 5),
     LIMIT(0x5413, 2, "Weight limit", 5..200, 5);
+
+    /** Transport envelope, not permission to command a particular trainer. */
+    val wireRange: IntRange get() = when (this) {
+        WEIGHT -> 5..250
+        BAND_MAXIMUM -> 15..250
+        ECCENTRIC -> -245..245
+        else -> range
+    }
+
+    fun validateWireValue(value: Int) {
+        require(value in wireRange && (this != RETURN_SPEED || value == 0 || value >= 100)) {
+            "Invalid $label."
+        }
+    }
 
     fun validate(value: Int) {
         require(value in range && (this != RETURN_SPEED || value == 0 || value >= 100)) {
@@ -124,6 +158,8 @@ data class TrainerState(
     val twinVerified: Boolean = false,
     /** Unit displayed by the trainer, or by the knob when connected through its bridge. */
     val weightUnit: WeightUnit? = null,
+    val lengthUnit: LengthUnit? = null,
+    val resistanceLimits: ResistanceLimits = ResistanceLimits(),
     val activeWeightSource: ActiveWeightSource? = null,
     /** Measured cable tension; can remain nonzero while the trainer is unloaded. */
     val measuredForceLb: Double? = null,
@@ -137,15 +173,32 @@ data class TrainerState(
     val deviceReps: Int? = null,
     /** Device-reported mode register; zero is idle, distinct from an unsupported or unread mode. */
     val modeWireValue: Int? = null,
+    /** Explicit motor capability. Old bridges and third-party connectors default to unsupported. */
+    val loadControlSupported: Boolean = false,
+    /** Fresh device-side admission, including cable-zero verification for loading. */
+    val loadAllowed: Boolean = false,
+    val unloadAllowed: Boolean = false,
+    /** A bridge may refresh cable evidence before checking whether one load command is safe. */
+    val loadPreparationAllowed: Boolean = false,
 ) {
     val connected
         get() = status == ConnectionStatus.READY
 
+    /**
+     * A mode register report confirms selection independently of motor readiness.
+     * Firmware 2.0 reports fitnessMode=0 while unloaded, including on its home
+     * screen. Preserve it; load permission also needs mode and connector guards.
+     * Both transports must include a recent mode report in [fresh].
+     */
+    val modeConfirmed
+        get() = connected && fresh && mode != null &&
+            (modeWireValue == null || modeWireValue == mode.wireValue)
+
     val unloaded
-        get() = fitnessMode == 4 || fitnessMode == 0
+        get() = isFitnessReady(fitnessMode)
 
     val loaded
-        get() = fitnessMode == 5 || fitnessMode == 21
+        get() = isFitnessLoaded(fitnessMode)
 
     val setWeightLb: Int?
         get() =
@@ -158,15 +211,43 @@ data class TrainerState(
                 .takeUnless { mode == TrainingMode.DAMPER }
 
     fun canEdit(parameter: Parameter): Boolean =
-        connected &&
-            fresh &&
+        modeConfirmed &&
             !pending &&
             twinStatusKnown &&
             (!twinReported || (twinVerified && twinRole == TwinRole.CONTROLLER)) &&
             parameter in parameters &&
             (editableParameters == null || parameter in editableParameters) &&
             parameter in Parameter.forMode(mode) &&
-            (unloaded || (parameter == Parameter.WEIGHT && fitnessMode in listOf(5, 21)))
+            (unloaded || (parameter == Parameter.WEIGHT && loaded))
+
+    private val motorControllerReady
+        get() =
+            modeConfirmed &&
+                !pending &&
+                twinStatusKnown &&
+                (!twinReported || (twinVerified && twinRole == TwinRole.CONTROLLER))
+
+    val canLoad
+        get() =
+            motorControllerReady &&
+                loadControlSupported &&
+                loadAllowed &&
+                isFitnessReady(fitnessMode)
+
+    /** Admits preparation only; the connector must verify fresh cable/settings before loading. */
+    val canPrepareLoad
+        get() =
+            motorControllerReady &&
+                loadControlSupported &&
+                loadPreparationAllowed &&
+                isFitnessReady(fitnessMode)
+
+    val canUnload
+        get() =
+            motorControllerReady &&
+                loadControlSupported &&
+                unloadAllowed &&
+                (loaded || fitnessMode in listOf(0x26, 0x27))
 
     val canChangeMode
         get() =
@@ -221,7 +302,21 @@ data class VoltraState(
      * Increases for each received topology snapshot; permits confirmation after a command fails.
      */
     val topologyRevision: Long = 0,
+    /** Exact existing bridge that may reconnect to resolve an uncertain Twin outcome. */
+    val recoverableKnobId: String? = null,
+    /** Per-trainer source revisions, including removed identities. Unrelated trainers are isolated. */
+    val trainerTelemetryEpochs: Map<String, Long> = emptyMap(),
 ) {
+    /** A set observes its bound trainer or native pair; legacy connectors use the aggregate epoch. */
+    fun telemetryEpochFor(deviceId: String, peerId: String? = null): Long {
+        val ids = listOfNotNull(deviceId, peerId)
+        val epochs = ids.map { id ->
+            trainerTelemetryEpochs.entries.firstOrNull { it.key.equals(id, ignoreCase = true) }?.value
+                ?: return telemetryEpoch
+        }
+        return epochs.max()
+    }
+
     fun routeFor(deviceId: String): VoltraConnectionRoute =
         trainerRoutes.entries.firstOrNull { it.key.equals(deviceId, ignoreCase = true) }?.value
             ?: if (viaKnob) VoltraConnectionRoute.KNOB else VoltraConnectionRoute.DIRECT
@@ -252,6 +347,34 @@ data class VoltraState(
                         !it.twinReported
                 }
 
+    /** Planning readiness only; native pairing still requires [canCreateTwin] after STOP. */
+    val canCreateTwinAfterUnloading: Boolean
+        get() =
+            canCreateTwin ||
+                (trainers.isNotEmpty() &&
+                    trainers.all { it.unloaded || it.canUnload } &&
+                    copy(
+                            trainers =
+                                trainers.map { if (it.canUnload) it.copy(fitnessMode = 4) else it }
+                        )
+                        .canCreateTwin)
+
+    /** A loaded native pair is unloaded through its verified controller, never its peer. */
+    val canExitTwinAfterUnloading: Boolean
+        get() {
+            if (canExitTwin) return true
+            val pair = twin ?: return false
+            val controller =
+                trainers.singleOrNull { it.device.id.equals(pair.controllerId, true) }
+                    ?: return false
+            if (!controller.canUnload) return false
+            return copy(
+                    trainers = trainers.map { it.copy(fitnessMode = 4) },
+                    knob = knob?.copy(twinExitAllowed = true),
+                )
+                .canExitTwin
+        }
+
     val canExitTwin: Boolean
         get() =
             connectionError == null &&
@@ -263,7 +386,9 @@ data class VoltraState(
                     knob?.twinExitAllowed == true) &&
                 !twinPending &&
                 trainers.size == 2 &&
-                trainers.map { it.device.id }.toSet() == setOf(twin.controllerId, twin.peerId) &&
+                !twin.controllerId.equals(twin.peerId, ignoreCase = true) &&
+                trainers.count { it.device.id.equals(twin.controllerId, ignoreCase = true) } == 1 &&
+                trainers.count { it.device.id.equals(twin.peerId, ignoreCase = true) } == 1 &&
                 trainers.all {
                     it.connected &&
                         it.fresh &&
@@ -273,7 +398,8 @@ data class VoltraState(
                         it.twinReported &&
                         it.twinVerified &&
                         it.twinRole ==
-                            if (it.device.id == twin.controllerId) TwinRole.CONTROLLER
+                            if (it.device.id.equals(twin.controllerId, ignoreCase = true))
+                                TwinRole.CONTROLLER
                             else TwinRole.PEER
                 }
 }
@@ -292,4 +418,6 @@ data class KnobState(
     val twinIdentityGuarded: Boolean = false,
     /** Trusted TV peer offers and explicit requests initiated by the knob are supported. */
     val mixedTwinHandoffSupported: Boolean = false,
+    /** Presentation only; never substitute for trainer freshness, topology or command results. */
+    val setupActivity: SetupActivity? = null,
 )

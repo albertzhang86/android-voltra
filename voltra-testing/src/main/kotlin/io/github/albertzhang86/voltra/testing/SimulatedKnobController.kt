@@ -70,6 +70,9 @@ class SimulatedKnobController(
     override suspend fun setParameter(deviceId: String, parameter: Parameter, value: Int) =
         delegate.setParameter(deviceId, parameter, value)
 
+    override suspend fun setLoaded(deviceId: String, loaded: Boolean) =
+        delegate.setLoaded(deviceId, loaded)
+
     override suspend fun createTwin(controllerId: String, peerId: String) {
         check(delegate.state.value.trainers.any { it.device.id == controllerId })
         if (delegate.state.value.trainers.none { it.device.id == peerId }) {

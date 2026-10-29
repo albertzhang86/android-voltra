@@ -1,4 +1,4 @@
-# Bluetooth knob bridge v2
+# Bluetooth knob bridge
 
 `KnobVoltraController` implements `VoltraController`. `AndroidKnobTransport` connects
 to the Guition VOLTRA Remote firmware's GATT server; the knob remains the trainer's
@@ -12,7 +12,7 @@ verifies both trainers are idle/unloaded, sends the controller address to the pe
 and waits for matching endpoint status. Exit stays on the controller. Commands are
 never replayed. Classified native Twin telemetry is carried separately from the
 physical members' readings; unclassified packets remain unavailable.
-Load, unload and trainer selection remain local to the knob.
+Trainer selection remains local to the knob. Optional v2 motor capability adds explicit, confirmed load/unload requests; old firmware does not advertise this capability.
 
 ## Pairing
 
@@ -25,6 +25,12 @@ advertises for trusted reconnection and verifies the authenticated Secure Connec
 identity; outside explicit pairing, new peers and replacement bonds are rejected.
 Reconnection does not replay setting commands. Android remembers the knob after a
 valid snapshot and restores that target only if its Bluetooth bond still exists.
+Each Android app connection disables then enables the Updates CCCD, waiting for
+both acknowledgments before accepting notifications. Matching firmware revokes
+the old command epoch on disable and creates a fresh epoch for the authenticated
+subscription. This also renews the command session when Android retains the
+underlying Bluetooth link across an app restart. Old queued commands cannot
+cross that boundary; command IDs remain strictly increasing within each epoch.
 Telemetry and commands are withheld before authentication. Disconnect TV is
 available on either device. PIN pairing, authenticated encryption and v2 bridge
 telemetry have been verified on a physical Google TV Streamer, including receiving
@@ -73,9 +79,9 @@ trainer UUIDs. Minimum negotiated MTU is 247; one notification carries one packe
 | Command (write with response) | `aed90002-4174-4ab6-a910-72457c592900` |
 | Updates (notify) | `aed90003-4174-4ab6-a910-72457c592900` |
 
-Every packet begins `4b 02 type`. Snapshot type is 1, mode command 2, parameter
+Commands and results begin `4b 02 type`. Current snapshots begin `4b 03 01`. Snapshot type is 1, mode command 2, parameter
 command 3, result 4, create Twin 5, exit Twin 6, peer offer 7, knob Twin request 8,
-and request status 9. The Android reader also accepts v1
+request status 9, and explicit motor state command 10. The Android reader also accepts v1
 snapshots/results and writes v1 settings to older firmware; v1 has no Twin controls. Reject unsupported versions and malformed lengths.
 
 Snapshot byte 3 flags are:
@@ -101,10 +107,23 @@ mode-edit flag at 30; parameter count at 31; zero-terminated UTF-8 name in 32..6
 ASCII trainer address in 64..81. Peer/candidate name occupies 82..113 and address
 114..131; battery at 132 (255 unknown); flags at 133 (can-create bit 0, can-exit bit 1).
 Bits 2..3 are an optional display-unit extension: 0 unknown/older firmware, 1 lb,
-2 kg, 3 reserved/unknown. The knob reports its displayed unit (Weight Training
-uses kg; other modes follow its reported unit setting). These flags do not change
+2 kg, 3 reserved/unknown. Current firmware reports the trainer's weight-unit
+preference in every supported mode; older firmware forced Weight Training to kg.
+These flags do not change
 the raw parameter or force units. Older readers ignore them and packet lengths
 remain unchanged. `TrainerState.weightUnit` exposes the preference to consumers.
+
+The uint16 mask at offset 28 also contains motor capabilities: `0x8000` supports
+confirmed motor commands, `0x4000` means current cable/settings evidence permits
+loading, and `0x2000` permits unloading. Optional `0x1000` permits load preparation
+with fresh controller identity, mode and settings even when background cable data
+is missing or stale. It does not claim that the motor is ready to load. A type-10
+load request first refreshes cable position, saved zero and settings; the firmware
+sends GO only after new matching readbacks pass the existing cable-zero check.
+Changed session, endpoint, settings, expired authorization or missing/extended
+cable blocks GO. No offset is changed and no motor command is retried.
+Readers expose `canPrepareLoad` separately from strict `canLoad`. Older firmware
+does not advertise preparation, and older apps ignore the new bit.
 Bit 4 of byte 133 identifies legacy runtime wire-weight telemetry (`0x3e83`);
 with bits 4, 6 and 7 clear, offset 22 is legacy measured cable force. These values
 populate `runtimeWireWeightLb` or `measuredForceLb`, never active resistance.
@@ -149,7 +168,7 @@ cleared when bridge readings expire. The Guition board has no exposed charging
 status input: its current detection uses USB SOF traffic, so a charge-only wall
 adapter or wireless charger cannot be identified reliably.
 Peer identity in paired status is from the controller endpoint report. Each of up
-to 11 entries at 134 has uint16 register
+to 11 entries at 142 (134 for v2) has uint16 register
 and int32 value. Parameter bit order is Weight, Chains, Inverse Chains, Eccentric,
 Band Maximum, Damper Level, Speed, Return Type, Return Speed, Return Weight, Limit.
 Parameter values use the library's protocol units. Snapshots publish at 4 Hz.
@@ -166,9 +185,9 @@ expiry; their bounded handshake/confirmation can take 40 seconds, rechecking the
 authenticated epoch and selected trainer session throughout. Local knob edits retain their gates.
 
 Results are 16 bytes: code at 3 (0 queued, 1 device-confirmed, 2 rejected, 3 timeout),
-epoch/session at 4/8, request ID at 12, reserved zero at 14. Queued is not success.
+epoch/session at 4/8, request ID at 12, optional motor failure reason at 14 (zero for other commands). Queued is not success.
 The TV waits for confirmation plus matching fresh snapshot readback. A five-second
-TV timeout (45 seconds for Twin) reports uncertainty; there is no automatic retry. Unknown/stale target resistance
+TV settings timeout (six seconds for motor control, 45 seconds for Twin) reports uncertainty; there is no automatic retry. Unknown/stale target resistance
 is never replaced by measured force or configured weight in the connector. Consumers
 can display the configured setpoint separately with its own label.
 A two-second notification gap disables
@@ -274,3 +293,69 @@ exit. A simulated end-to-end workout also exercises topology transitions.
 Automatic workout transitions, failure recovery across real device interruptions,
 other training modes and direct-TV native Twin telemetry still require separate
 hardware acceptance; automated checks and successful builds do not establish it.
+
+## Optional confirmed motor operation
+
+Snapshot uint16 mask at bytes28..29 retains parameter bits0..10. Bit15 advertises motor support, bit14 permits load now, and bit13 permits unload now. Dynamic flags never bypass normal fresh-state, pending, mode or native controller checks. No packet size, MAC string, or protocol-version change is needed; older readers ignore the high bits.
+
+Command10 uses the existing24-byte envelope: flags byte3=0; epoch/session/deadline at4/8/12; nonzero monotonically increasing uint16 requestID at16; field18=0; int32 value20=1(load) or0(unload). It must pass the authenticated logical session and strict replay/deadline guards. It is never carried over reconnects or automatically retried.
+
+The worker captures the supported mode and exact native controller/peer identity at admission. Load sends the existing setup query once, requires new cable-position and saved-offset readbacks, checks the verified zero predicate again, and sends GO once. Unload sends STOP once. Fresh post-command status must confirm the requested state. Local unload remains available to cancel work; revoked epoch/session or changed endpoint/mode blocks a queued load. Neither operation sets a custom cable offset.
+
+Result4 keeps the16-byte shape and codes0(queued),1(confirmed),2(rejected),3(failed/unconfirmed). Optional uint16 reason at14:0 none,1 state/busy,2 cable not at zero,3 endpoint or mode changed,4 revoked/expired,5 write failed,6 not confirmed,7 cable readings missing/stale,8 configuration changed,9 configuration readback missing/stale. Android requires result1 **and** a newer fresh snapshot of the same session, mode and controller/pair before returning success. A successful BLE write or queued result is insufficient.
+
+Host and library tests validate this contract; physical automatic motor control and all-mode workout progression remain pending acceptance.
+
+Cancelling or timing out a dispatched motor request revokes the knob connection instead of merely abandoning the result. Android blocks new writes/snapshots, attempts CCCD0 with a bounded500ms acknowledgment window, then always closes GATT. Firmware clears the worker epoch synchronously on CCCD0 before acknowledging it, preventing a queued setup from later sending GO. If GATT cannot acknowledge, link closure is the fallback. This cannot undo a GO already transmitted; load state remains uncertain and must be checked before reconnecting. No command is replayed after reconnect.
+
+
+For an explicit mixed Create Twin button press, the peer offer's planning-ready
+flag may include a fresh trainer that supports confirmed unloading. The Android
+controller consumes that request once, reserves both routes, confirms each
+required STOP, and only then enters the existing exact-peer handoff. Actual
+handoff authorization and native topology writes still require fresh unloaded
+readbacks. Temporary busy state preserves peer ownership but disables new
+requests; the accepted request never authorizes a GO command. A failed or
+cancelled preparation needs a new explicit request. These automatic manual-unload
+paths are covered by replay tests; physical acceptance remains pending.
+
+
+## Snapshot v3: device units and resistance limits
+
+The first 134 bytes retain v2 meanings. Byte 133 weight-unit flags always describe
+register `0x506e` in every training mode: unknown/lb/kg; Weight Training no longer
+forces kg. Byte 134 adds `0x506f`: 0 cm, 1 in, 255 unknown. Positions and velocities
+remain cm and mm/s internally; preferences affect display only.
+
+Bytes 135–136 contain the current allowed-force ceiling in uint16 protocol lb.
+Byte 137 is its source: 0 conservative legacy 200 lb, 1 validated trainer readback
+from `0x5314`. Byte 138 bit 0 advertises setup-display heartbeats; byte 139 carries
+the overall display activity (zero when absent). Bytes 140–141 remain reserved.
+Parameter entries start at 142;
+the maximum notification length is 208, within the required MTU 247. Commands
+and results remain v2 even when the most recent snapshot is v3.
+
+New Android clients read v1/v2/v3 snapshots; v2 has no length unit or device limit.
+Old clients reject v3 instead of interpreting its new offsets as settings. Install
+the TV library/app update before the new knob firmware. Unsupported unit values
+remain unknown. Weight/Band and signed eccentric limits use the reported ceiling;
+Isokinetic's own parameter limits remain distinct. Neither endpoint writes the
+allowed-force register or enables Overdrive.
+
+### Setup display heartbeat
+
+Command type 11 is presentation only. It uses the usual 24-byte v2 envelope,
+authenticated TV epoch and current trainer session, ID zero, field 0–5, and value
+zero. The field is clear/connecting/creating Twin/exiting Twin/configuring/loading.
+Clients send it only when snapshot byte 138 advertises support. The deadline must
+be fresh, at most two seconds ahead and strictly increasing within the TV epoch.
+It neither consumes motor-command IDs nor changes readiness, telemetry, ownership
+or command admission. It has no acknowledgement.
+
+The client refreshes every 750 ms while a scoped setup activity is active and
+sends clear on scope closure. The display lease expires six seconds after the
+heartbeat deadline, allowing brief expected reconnects without leaving a stuck
+spinner after app failure. New commands must still match the current session;
+only the visual intent spans session changes. Local knob Twin requests expose
+the same overall activity until their native transaction completes. Final errors
+remain in the ordinary status path after the operation ends.
