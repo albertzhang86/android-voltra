@@ -7,6 +7,7 @@ import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import io.github.albertzhang86.voltra.*
 import java.util.UUID
@@ -173,6 +174,7 @@ private class AndroidVoltraLink(
     private var writer: BluetoothGattCharacteristic? = null
     private var descriptor: BluetoothGattDescriptor? = null
     private var writeResult: CompletableDeferred<Unit>? = null
+    private var writeSequence = 0L
     private var revocationResult: CompletableDeferred<Unit>? = null
     private var revocationFinished: CompletableDeferred<Unit>? = null
     private val callback =
@@ -280,7 +282,9 @@ private class AndroidVoltraLink(
             ) {
                 if (closed.get() || characteristic.uuid != profile.write) return
                 if (status == BluetoothGatt.GATT_SUCCESS) writeResult?.complete(Unit)
-                else fail("${profile.label} Bluetooth write failed ($status).")
+                else fail(GattWriteFailure(
+                    "${profile.label} Bluetooth write callback failed (status $status). Reconnect to continue."
+                ))
             }
 
             override fun onCharacteristicChanged(
@@ -369,12 +373,21 @@ private class AndroidVoltraLink(
                     else BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
                 val completion = CompletableDeferred<Unit>()
                 writeResult = completion
+                val sequence = ++writeSequence
+                val startedAt = SystemClock.elapsedRealtime()
                 try {
-                    val accepted = writeNative(characteristic, frame.copyOf(), type)
-                    check(accepted) { "${profile.label} could not accept the Bluetooth write." }
-                    if (response) withTimeout(3_000) { completion.await() } else delay(40)
+                    writeNative(characteristic, frame.copyOf(), type)
+                    if (response) {
+                        awaitGattWriteAcknowledgement(profile.label) { completion.await() }
+                    } else delay(40)
                 } catch (failure: Exception) {
-                    fail("${profile.label} write was interrupted. Reconnect before retrying.")
+                    trace(
+                        "write=$sequence type=$type bytes=${frame.size} elapsedMs=${SystemClock.elapsedRealtime() - startedAt} " +
+                            "cause=${failure.javaClass.simpleName}"
+                    )
+                    // A callback may already have failed/closed the link. Preserve its first cause.
+                    // An uncertain write always closes the link; commands are never replayed here.
+                    if (!closed.get()) fail(describeGattWriteFailure(profile.label, failure))
                     throw failure
                 } finally {
                     writeResult = null
@@ -422,14 +435,19 @@ private class AndroidVoltraLink(
         characteristic: BluetoothGattCharacteristic,
         value: ByteArray,
         type: Int,
-    ): Boolean =
-        if (Build.VERSION.SDK_INT >= 33)
-            gatt.writeCharacteristic(characteristic, value, type) == BluetoothStatusCodes.SUCCESS
-        else {
+    ) {
+        if (Build.VERSION.SDK_INT >= 33) {
+            requireGattWriteAccepted(profile.label, gatt.writeCharacteristic(characteristic, value, type))
+        } else {
             characteristic.writeType = type
             characteristic.value = value
-            gatt.writeCharacteristic(characteristic)
+            if (!gatt.writeCharacteristic(characteristic)) {
+                throw GattWriteFailure(
+                    "${profile.label} Bluetooth write was rejected by Android (legacy API). Reconnect to continue."
+                )
+            }
         }
+    }
 
     private fun operation(block: () -> Unit) {
         try {
